@@ -1,0 +1,28 @@
+# Python
+__pycache__/
+*.py[cod]
+*.pyd
+*.so
+.Python
+
+# Virtualenvs
+.venv/
+venv/
+ENV/
+
+# OS / editor
+.DS_Store
+Thumbs.db
+.vscode/
+
+# Secrets / local config
+.env
+.env.*
+
+# Generated outputs (scrape runs)
+outputs_*/
+*.log
+
+# PDFs (generated)
+README.pdf
+
