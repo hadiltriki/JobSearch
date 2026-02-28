@@ -189,7 +189,17 @@ def parse_salary(raw: str) -> Optional[Dict[str, Any]]:
     cleaned = re.sub(r"(\d)\s*k\b", lambda m: m.group(1) + "000", cleaned, flags=re.IGNORECASE)
 
     numbers = re.findall(r"[\d,]+(?:\.\d+)?", cleaned)
-    values = [float(n.replace(",", "")) for n in numbers if float(n.replace(",", "")) >= 15]
+    values = []
+    for n in numbers:
+        stripped = n.replace(",", "").strip()
+        if not stripped or stripped == ".":
+            continue
+        try:
+            v = float(stripped)
+            if v >= 15:
+                values.append(v)
+        except ValueError:
+            continue
 
     if len(values) >= 2:
         return {"currency": currency, "min": values[0], "max": values[1], "period": period, "raw": raw}
