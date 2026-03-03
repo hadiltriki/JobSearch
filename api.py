@@ -7,6 +7,9 @@ Run:  uvicorn api:app --reload --port 8000
 
 from __future__ import annotations
 
+from dotenv import load_dotenv
+load_dotenv()
+
 import io
 import json
 import statistics
@@ -30,6 +33,7 @@ from job_analyzer_agent import (
     PROFILE_FILE,
     LEARNING_META,
 )
+import db as database
 
 # ── Data loading ────────────────────────────────────────────────────────
 
@@ -50,7 +54,15 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
+@app.on_event("startup")
+def startup():
+    database.init_db()
+
 # ── Pydantic models ─────────────────────────────────────────────────────
+
+class UserLogin(BaseModel):
+    user_id: str
+
 
 class ProfileIn(BaseModel):
     name: str = ""
@@ -60,14 +72,16 @@ class ProfileIn(BaseModel):
     preferred_locations: list[str] = []
     open_to_remote: bool = True
     salary_expectation: str = ""
+    user_id: str = ""
 
 
 class ChatIn(BaseModel):
     message: str
     profile: ProfileIn | None = None
+    user_id: str = ""
 
 
-def _load_profile() -> CandidateProfile | None:
+def _load_profile_file() -> CandidateProfile | None:
     if PROFILE_PATH.exists():
         try:
             return CandidateProfile.load(PROFILE_PATH)
@@ -77,12 +91,31 @@ def _load_profile() -> CandidateProfile | None:
 
 
 def _to_profile(p: ProfileIn) -> CandidateProfile:
-    return CandidateProfile(**p.model_dump())
+    d = p.model_dump()
+    d.pop("user_id", None)
+    return CandidateProfile(**d)
 
 
 # ═══════════════════════════════════════════════════════════════════════
 #  Endpoints
 # ═══════════════════════════════════════════════════════════════════════
+
+@app.post("/api/login")
+def login(data: UserLogin):
+    uid = data.user_id.strip()
+    if not uid:
+        raise HTTPException(400, "User ID is required")
+    if database.DSN:
+        user = database.find_user(uid)
+        if not user:
+            raise HTTPException(404, f"User ID '{uid}' not found")
+        return {
+            "authenticated": True,
+            "user_id": uid,
+            "user": user,
+        }
+    return {"authenticated": True, "user_id": uid}
+
 
 @app.get("/api/status")
 def status():
@@ -94,8 +127,12 @@ def status():
 
 
 @app.get("/api/profile")
-def get_profile():
-    p = _load_profile()
+def get_profile(user_id: str = ""):
+    if user_id and database.DSN:
+        db_prof = database.load_profile(user_id)
+        if db_prof:
+            return {"exists": True, **db_prof}
+    p = _load_profile_file()
     if not p:
         return {"exists": False}
     return {"exists": True, **p.__dict__}
@@ -105,6 +142,8 @@ def get_profile():
 def save_profile(data: ProfileIn):
     prof = _to_profile(data)
     prof.save(PROFILE_PATH)
+    if data.user_id and database.DSN:
+        database.save_profile(data.user_id, data.model_dump())
     gap = compute_gap(analysis, prof.skills_set()) if prof.skills else None
     return {
         "saved": True,
@@ -248,69 +287,92 @@ def get_market():
 
 @app.post("/api/chat")
 def chat(data: ChatIn):
-    prof = _to_profile(data.profile) if data.profile else _load_profile() or CandidateProfile()
+    prof = _to_profile(data.profile) if data.profile else _load_profile_file() or CandidateProfile()
     gap = compute_gap(analysis, prof.skills_set()) if prof.skills else None
     ms = match_jobs(analysis, prof, top_n=15) if prof.skills else []
     m = data.message.lower()
 
+    if data.user_id and database.DSN:
+        database.save_chat_message(data.user_id, "user", data.message)
+
+    response, intent = "", "unknown"
+
     if any(w in m for w in ["match", "job", "find", "opening", "position"]):
         if not ms:
-            return {"response": "No matches found. Try broadening your skills or target role."}
-        lines = [f"Here are your **top 10 job matches**, {prof.name}:\n"]
-        for i, mt in enumerate(ms[:10], 1):
-            j = mt["job"]
-            lines.append(
-                f"**{i}. {j.get('title','')}** at {j.get('company','')}\n"
-                f"> {mt['total']}% fit ({mt['verdict']}) · "
-                f"{j.get('location','') or 'N/A'}\n"
-            )
-        return {"response": "\n".join(lines), "intent": "matches"}
+            response, intent = "No matches found. Try broadening your skills or target role.", "matches"
+        else:
+            lines = [f"Here are your **top 10 job matches**, {prof.name}:\n"]
+            for i, mt in enumerate(ms[:10], 1):
+                j = mt["job"]
+                lines.append(
+                    f"**{i}. {j.get('title','')}** at {j.get('company','')}\n"
+                    f"> {mt['total']}% fit ({mt['verdict']}) · "
+                    f"{j.get('location','') or 'N/A'}\n"
+                )
+            response, intent = "\n".join(lines), "matches"
 
-    if any(w in m for w in ["gap", "missing", "lack", "need"]):
+    elif any(w in m for w in ["gap", "missing", "lack", "need"]):
         if not gap:
-            return {"response": "Enter your skills first so I can analyse your gap."}
-        lines = [f"**Your market coverage: {gap['coverage']:.0%}**\n"]
-        for i, (s, c) in enumerate(gap["missing"][:10], 1):
-            lines.append(f"{i}. **{s}** — {c} jobs need this")
-        return {"response": "\n".join(lines), "intent": "gap"}
+            response, intent = "Enter your skills first so I can analyse your gap.", "gap"
+        else:
+            lines = [f"**Your market coverage: {gap['coverage']:.0%}**\n"]
+            for i, (s, c) in enumerate(gap["missing"][:10], 1):
+                lines.append(f"{i}. **{s}** — {c} jobs need this")
+            response, intent = "\n".join(lines), "gap"
 
-    if any(w in m for w in ["road", "learn", "path", "plan", "study"]):
+    elif any(w in m for w in ["road", "learn", "path", "plan", "study"]):
         if not gap:
-            return {"response": "I need your skills to build a roadmap."}
-        lines = [f"**Learning Roadmap for {prof.name}:**\n"]
-        for s, c in gap["missing"][:10]:
-            meta = LEARNING_META.get(s, {})
-            lines.append(f"- **{s}** (~{meta.get('w',4)} wks) — *{meta.get('tip','Docs + projects')}*")
-        return {"response": "\n".join(lines), "intent": "roadmap"}
+            response, intent = "I need your skills to build a roadmap.", "roadmap"
+        else:
+            lines = [f"**Learning Roadmap for {prof.name}:**\n"]
+            for s, c in gap["missing"][:10]:
+                meta = LEARNING_META.get(s, {})
+                lines.append(f"- **{s}** (~{meta.get('w',4)} wks) — *{meta.get('tip','Docs + projects')}*")
+            response, intent = "\n".join(lines), "roadmap"
 
-    if any(w in m for w in ["salary", "pay", "earn", "money"]):
+    elif any(w in m for w in ["salary", "pay", "earn", "money"]):
         lines = ["**Salary insights:**\n"]
         for cur, vals in sorted(analysis.salary_by_currency.items()):
             if len(vals) >= 2:
                 lines.append(f"**{cur}** ({len(vals)} jobs): {min(vals):,.0f} – {max(vals):,.0f} (median {statistics.median(vals):,.0f})")
-        return {"response": "\n".join(lines), "intent": "salary"}
+        response, intent = "\n".join(lines), "salary"
 
-    if any(w in m for w in ["market", "overview", "trend", "demand"]):
+    elif any(w in m for w in ["market", "overview", "trend", "demand"]):
         top10 = analysis.skill_counts.most_common(10)
         lines = [f"**Market:** {analysis.total} jobs, {len(analysis.sources)} sources\n"]
         for i, (s, c) in enumerate(top10, 1):
             lines.append(f"{i}. **{s}** — {c} mentions")
-        return {"response": "\n".join(lines), "intent": "market"}
+        response, intent = "\n".join(lines), "market"
 
-    if any(w in m for w in ["competi", "strong", "coverage", "chance"]):
+    elif any(w in m for w in ["competi", "strong", "coverage", "chance"]):
         if not gap:
-            return {"response": "Complete your profile first."}
-        cov = gap["coverage"]
-        v = "strong" if cov >= 0.5 else ("competitive" if cov >= 0.25 else "building")
-        return {"response": f"You're **{v}** at **{cov:.0%}** coverage. Skills matched: {len(gap['matched'])} / {gap['total_market_skills']}", "intent": "competitive"}
+            response, intent = "Complete your profile first.", "competitive"
+        else:
+            cov = gap["coverage"]
+            v = "strong" if cov >= 0.5 else ("competitive" if cov >= 0.25 else "building")
+            response, intent = f"You're **{v}** at **{cov:.0%}** coverage. Skills matched: {len(gap['matched'])} / {gap['total_market_skills']}", "competitive"
 
-    if any(w in m for w in ["help", "what can", "menu"]):
-        return {"response": "Ask me about: **jobs**, **skills gap**, **roadmap**, **salary**, **market**, **competitiveness**", "intent": "help"}
+    elif any(w in m for w in ["help", "what can", "menu"]):
+        response, intent = "Ask me about: **jobs**, **skills gap**, **roadmap**, **salary**, **market**, **competitiveness**", "help"
 
-    if any(w in m for w in ["hi", "hello", "hey"]):
-        return {"response": f"Hey {prof.name or 'there'}! Ask me about jobs, skills, salaries, or your career path.", "intent": "greeting"}
+    elif any(w in m for w in ["hi", "hello", "hey"]):
+        response, intent = f"Hey {prof.name or 'there'}! Ask me about jobs, skills, salaries, or your career path.", "greeting"
 
-    return {"response": f"Try asking about: jobs, skills gap, roadmap, salary, market, or competitiveness.", "intent": "unknown"}
+    else:
+        response, intent = "Try asking about: jobs, skills gap, roadmap, salary, market, or competitiveness.", "unknown"
+
+    if data.user_id and database.DSN:
+        database.save_chat_message(data.user_id, "assistant", response)
+
+    return {"response": response, "intent": intent}
+
+
+@app.get("/api/chat/history")
+def chat_history(user_id: str = ""):
+    if not user_id or not database.DSN:
+        return {"messages": []}
+    msgs = database.load_chat_history(user_id)
+    return {"messages": msgs}
 
 
 @app.post("/api/report")

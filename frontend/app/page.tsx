@@ -34,6 +34,12 @@ const emptyProfile: Profile = {
 };
 
 export default function Home() {
+  const [userId, setUserId] = useState("");
+  const [authenticated, setAuthenticated] = useState(false);
+  const [loginInput, setLoginInput] = useState("");
+  const [loginError, setLoginError] = useState("");
+  const [loginLoading, setLoginLoading] = useState(false);
+
   const [messages, setMessages] = useState<Msg[]>([]);
   const [input, setInput] = useState("");
   const [profile, setProfile] = useState<Profile>(emptyProfile);
@@ -53,18 +59,64 @@ export default function Home() {
   const [pdfLoading, setPdfLoading] = useState(false);
   const chatEnd = useRef<HTMLDivElement>(null);
 
+  useEffect(() => {
+    const saved = sessionStorage.getItem("career_user_id");
+    if (saved) { setUserId(saved); setAuthenticated(true); }
+  }, []);
+
+  async function handleLogin() {
+    const uid = loginInput.trim();
+    if (!uid) { setLoginError("Please enter your User ID"); return; }
+    setLoginLoading(true);
+    setLoginError("");
+    try {
+      const res = await fetch(`${API}/login`, {
+        method: "POST", headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ user_id: uid }),
+      });
+      if (res.status === 404) {
+        setLoginError("User ID not found. Please check and try again.");
+        setLoginLoading(false);
+        return;
+      }
+      const data = await res.json();
+      if (data.authenticated) {
+        setUserId(uid);
+        setAuthenticated(true);
+        sessionStorage.setItem("career_user_id", uid);
+        if (data.user) {
+          setProfile(prev => ({
+            ...prev,
+            name: data.user.name || prev.name,
+            target_role: data.user.target_role || prev.target_role,
+            experience_years: data.user.experience_years || prev.experience_years,
+            skills: data.user.skills?.length ? data.user.skills : prev.skills,
+          }));
+        }
+      } else {
+        setLoginError("Authentication failed. Please try again.");
+      }
+    } catch {
+      setLoginError("Cannot connect to server. Make sure the backend is running.");
+    } finally {
+      setLoginLoading(false);
+    }
+  }
+
   useEffect(() => { chatEnd.current?.scrollIntoView({ behavior: "smooth" }); }, [messages]);
 
   useEffect(() => {
+    if (!authenticated) return;
     (async () => {
       const [sRes, pRes] = await Promise.all([
-        fetch(`${API}/status`), fetch(`${API}/profile`),
+        fetch(`${API}/status`),
+        fetch(`${API}/profile?user_id=${encodeURIComponent(userId)}`),
       ]);
       const s = await sRes.json();
       const p = await pRes.json();
       setStatus(s);
       if (p.exists && p.name && p.skills?.length) {
-        setProfile(p);
+        setProfile({ ...p, user_id: userId });
         setStep(6);
         setMessages([{
           role: "assistant",
@@ -79,7 +131,7 @@ export default function Home() {
         }]);
       }
     })();
-  }, []);
+  }, [authenticated]);
 
   async function loadAnalysis(p: Profile) {
     const [mRes, gRes, rRes, mkRes] = await Promise.all([
@@ -133,7 +185,7 @@ export default function Home() {
     setStep(6);
     fetch(`${API}/profile`, {
       method: "POST", headers: { "Content-Type": "application/json" },
-      body: JSON.stringify(p),
+      body: JSON.stringify({ ...p, user_id: userId }),
     });
     loadAnalysis(p);
     return `✅ **Your profile is ready!**\n\n| | |\n|---|---|\n| **Name** | ${p.name} |\n| **Target** | ${p.target_role} |\n| **Experience** | ${p.experience_years} yrs |\n| **Skills** | ${p.skills.slice(0, 8).join(", ")} |\n| **Location** | ${p.preferred_locations.join(", ") || "Anywhere"} |\n\nAsk me anything:\n- *"Find me matching jobs"*\n- *"What skills am I missing?"*\n- *"Build me a learning roadmap"*`;
@@ -153,7 +205,7 @@ export default function Home() {
 
     const res = await fetch(`${API}/chat`, {
       method: "POST", headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({ message: userMsg, profile }),
+      body: JSON.stringify({ message: userMsg, profile, user_id: userId }),
     });
     const data = await res.json();
     setMessages(prev => [...prev, { role: "assistant", content: data.response }]);
@@ -166,12 +218,68 @@ export default function Home() {
     return true;
   });
 
+  if (!authenticated) {
+    return (
+      <div className="min-h-screen flex items-center justify-center px-4">
+        <div className="w-full max-w-md">
+          <div className="bg-dark-800 rounded-2xl border border-dark-700 p-8 shadow-2xl">
+            <div className="text-center mb-8">
+              <div className="w-16 h-16 bg-brand/20 rounded-2xl flex items-center justify-center mx-auto mb-4">
+                <span className="text-3xl">🎯</span>
+              </div>
+              <h1 className="text-2xl font-bold">Career Assistant</h1>
+              <p className="text-gray-400 text-sm mt-2">Enter your User ID to access the platform</p>
+            </div>
+            <form onSubmit={e => { e.preventDefault(); handleLogin(); }} className="space-y-4">
+              <div>
+                <label className="block text-xs text-gray-400 mb-1.5 font-medium">User ID</label>
+                <input
+                  value={loginInput}
+                  onChange={e => { setLoginInput(e.target.value); setLoginError(""); }}
+                  placeholder="e.g. 1"
+                  autoFocus
+                  className="w-full bg-dark-900 border border-dark-700 rounded-xl px-4 py-3 text-sm focus:outline-none focus:border-brand focus:ring-1 focus:ring-brand transition"
+                />
+              </div>
+              {loginError && (
+                <p className="text-red-400 text-xs bg-red-400/10 rounded-lg px-3 py-2">{loginError}</p>
+              )}
+              <button
+                type="submit"
+                disabled={loginLoading}
+                className="w-full bg-brand hover:bg-brand-light text-white py-3 rounded-xl font-semibold text-sm transition disabled:opacity-50 flex items-center justify-center gap-2"
+              >
+                {loginLoading ? (
+                  <><svg className="animate-spin h-4 w-4" viewBox="0 0 24 24"><circle className="opacity-25" cx="12" cy="12" r="10" stroke="currentColor" strokeWidth="4" fill="none"/><path className="opacity-75" fill="currentColor" d="M4 12a8 8 0 018-8v4a4 4 0 00-4 4H4z"/></svg> Connecting...</>
+                ) : "Sign In"}
+              </button>
+            </form>
+            <p className="text-center text-gray-600 text-[11px] mt-6">Your data will be stored with this User ID for future sessions</p>
+          </div>
+        </div>
+      </div>
+    );
+  }
+
   return (
     <div className="max-w-6xl mx-auto px-4 py-6">
       {/* Header */}
       <div className="text-center mb-6">
-        <h1 className="text-3xl font-bold">🎯 Career Assistant</h1>
-        <p className="text-gray-400 text-sm mt-1">Your AI career coach — chat, then explore results below</p>
+        <div className="flex items-center justify-between">
+          <div />
+          <div>
+            <h1 className="text-3xl font-bold">🎯 Career Assistant</h1>
+            <p className="text-gray-400 text-sm mt-1">Your AI career coach — chat, then explore results below</p>
+          </div>
+          <div className="flex items-center gap-2 text-xs text-gray-500">
+            <span className="bg-dark-800 border border-dark-700 px-3 py-1.5 rounded-lg">👤 {userId}</span>
+            <button
+              onClick={() => { setAuthenticated(false); setUserId(""); sessionStorage.removeItem("career_user_id"); }}
+              className="text-gray-500 hover:text-red-400 transition px-2 py-1.5"
+              title="Sign out"
+            >✕</button>
+          </div>
+        </div>
       </div>
 
       {/* Chat */}
