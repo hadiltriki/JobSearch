@@ -640,18 +640,18 @@ async def scrape_remoteok(query: str, session: aiohttp.ClientSession) -> list[di
 #  3.  emploitic.com
 # ══════════════════════════════════════════════════════════════════════════════
 #
-#  Stratégie :
-#    1. Sitemap index (sitemap.xml) → trouver sitemap-jobs.xml
-#    2. Parser le sitemap → liste (url, lastmod) triée du + récent au + vieux
-#    3. Pour chaque URL :
-#         a. Si lastmod > 45j → STOP (les suivantes sont plus vieilles)
-#         b. Fetch HTML → extraire JSON-LD JobPosting
-#         c. Normaliser → dict compatible handle_job()
-#    4. Délai EMPLOITIC_DELAY entre requêtes
-#    5. STOP uniquement sur cutoff date
+#  Strategy:
+#    1. Sitemap index (sitemap.xml) → find sitemap-jobs.xml
+#    2. Parse the sitemap → list (url, lastmod) sorted from newest to oldest
+#    3. For each URL:
+#         a. If lastmod > 45 days → STOP (the following ones are older)
+#         b. Fetch HTML → extract JSON-LD JobPosting
+#         c. Normalize → dict compatible with handle_job()
+#    4. EMPLOITIC_DELAY delay between requests
+#    5. STOP only on cutoff date
 #
-#  Format date visible sur le site (cf. capture) :
-#    "Aujourd'hui", "Hier", "Il y a 3 jours", "Confirmé / Expérimenté (3 À 5 Ans)"
+#  Date format visible on the site (cf. screenshot):
+#    "Today", "Yesterday", "3 days ago", "Confirmed / Experienced (3 To 5 Years)"
 
 _EMP_HTML_HEADERS = {
     "User-Agent":      BROWSER_HEADERS["User-Agent"],
@@ -667,17 +667,17 @@ _EMP_XML_HEADERS = {
 }
 
 
-# ── Date helpers emploitic ────────────────────────────────────────────────────
+# ── Emploitic date helpers ────────────────────────────────────────────────────
 
 def _emp_parse_date(text: str) -> datetime | None:
     """
-    Parse les formats de date emploitic.com (français) :
-      "Aujourd'hui"               → maintenant
-      "Hier"                      → -1 jour
-      "Il y a 3 jours"            → -3 jours
-      "Il y a 2 semaines"         → -14 jours
-      "Il y a 1 mois"             → -30 jours
-      "12/01/2025"  "12-01-2025"  → format FR JJ/MM/AAAA
+    Parse emploitic.com date formats (French):
+      "Aujourd'hui"               → now
+      "Hier"                      → -1 day
+      "Il y a 3 jours"            → -3 days
+      "Il y a 2 semaines"         → -14 days
+      "Il y a 1 mois"             → -30 days
+      "12/01/2025"  "12-01-2025"  → FR format DD/MM/YYYY
       "2025-01-12"                → ISO
       "2025-01-12T10:00:00Z"      → ISO datetime (JSON-LD datePosted)
     """
@@ -699,7 +699,7 @@ def _emp_parse_date(text: str) -> datetime | None:
     m = re.search(r"il\s+y\s+a\s+(\d+)\s+an",       low)
     if m: return now - timedelta(days=int(m.group(1)) * 365)
 
-    # Format FR : JJ/MM/AAAA ou JJ-MM-AAAA
+    # FR format: DD/MM/YYYY or DD-MM-YYYY
     m = re.match(r'^(\d{1,2})[/\-\.](\d{1,2})[/\-\.](\d{4})$', s)
     if m:
         try:
@@ -723,7 +723,7 @@ def _emp_parse_date(text: str) -> datetime | None:
 
 
 def _emp_age_label(dt: datetime | None) -> str:
-    """Label en anglais (cohérent avec aijobs/remoteok)."""
+    """English label (consistent with aijobs/remoteok)."""
     if dt is None:
         return ""
     days = max(0, (datetime.now() - dt).days)
@@ -732,11 +732,11 @@ def _emp_age_label(dt: datetime | None) -> str:
     return f"{days} days ago"
 
 
-# ── Fetch helpers emploitic ───────────────────────────────────────────────────
+# ── Emploitic fetch helpers ───────────────────────────────────────────────────
 
 async def _emp_fetch(url: str, session: aiohttp.ClientSession,
                      is_xml: bool = False) -> str | None:
-    """Fetch une URL emploitic, gère 429/retry, retourne le texte ou None."""
+    """Fetch an emploitic URL, handles 429/retry, returns text or None."""
     headers = _EMP_XML_HEADERS if is_xml else _EMP_HTML_HEADERS
     for attempt in range(1, 4):
         try:
@@ -749,7 +749,7 @@ async def _emp_fetch(url: str, session: aiohttp.ClientSession,
                     return await resp.text(encoding="utf-8", errors="replace")
                 if resp.status == 429:
                     wait = 20 * attempt
-                    print(f"  [emploitic] 429 → attente {wait}s (tentative {attempt})")
+                    print(f"  [emploitic] 429 → waiting {wait}s (attempt {attempt})")
                     await asyncio.sleep(wait); continue
                 if resp.status in (403, 404):
                     print(f"  [emploitic] {resp.status} → {url[:70]}")
@@ -757,7 +757,7 @@ async def _emp_fetch(url: str, session: aiohttp.ClientSession,
                 print(f"  [emploitic] HTTP {resp.status} → {url[:70]}")
                 return None
         except Exception as e:
-            print(f"  [emploitic] error (tentative {attempt}): {e}")
+            print(f"  [emploitic] error (attempt {attempt}): {e}")
             if attempt < 3:
                 await asyncio.sleep(5)
     return None
@@ -770,7 +770,7 @@ def _emp_xml_tag(tag: str) -> str:
 
 
 def _emp_parse_sitemap_index(xml_text: str) -> list[str]:
-    """Retourne les URLs des sous-sitemaps, sitemap-jobs.xml en premier."""
+    """Returns sub-sitemap URLs, with sitemap-jobs.xml first."""
     try:
         root = ET.fromstring(xml_text)
     except ET.ParseError:
@@ -782,16 +782,16 @@ def _emp_parse_sitemap_index(xml_text: str) -> list[str]:
         for node in child:
             if _emp_xml_tag(node.tag) == "loc" and (node.text or "").strip():
                 locs.append(node.text.strip())
-    # Priorité aux sitemaps "jobs"
+    # Prioritize "jobs" sitemaps
     locs.sort(key=lambda u: 0 if "jobs" in u.lower() else 1)
     return locs
 
 
 def _emp_parse_job_sitemap(xml_text: str) -> list[tuple[str, datetime | None]]:
     """
-    Parse un sitemap de jobs.
-    Filtre : garde uniquement les URLs /offres-d-emploi/.
-    Retourne liste de (url, lastmod) triée du plus récent au plus vieux.
+    Parses a jobs sitemap.
+    Filter: keeps only /offres-d-emploi/ URLs.
+    Returns list of (url, lastmod) sorted newest to oldest.
     """
     try:
         root = ET.fromstring(xml_text)
@@ -821,7 +821,7 @@ def _emp_parse_job_sitemap(xml_text: str) -> list[tuple[str, datetime | None]]:
     return entries
 
 
-# ── JSON-LD extraction (basé sur le script de référence fourni) ───────────────
+# ── JSON-LD extraction (based on the provided reference script) ───────────────
 
 def _emp_extract_jsonld_objects(html_text: str) -> list[dict]:
     scripts = re.findall(
@@ -863,7 +863,7 @@ def _emp_find_jobposting(objs: list[dict]) -> dict | None:
 
 
 def _emp_clean(s: str) -> str:
-    """Nettoie le texte : strip tags HTML, collapse whitespace."""
+    """Cleans text: strip HTML tags, collapse whitespace."""
     import html as _html
     s = _html.unescape(s or "")
     s = re.sub(r"(?is)<(script|style)\b.*?>.*?</\1>", " ", s)
@@ -871,7 +871,7 @@ def _emp_clean(s: str) -> str:
     return re.sub(r"\s+", " ", s).strip()
 
 
-# ── Extracteurs de champs (portage async du script de référence) ──────────────
+# ── Field extractors (async port of the reference script) ────────────────────
 
 def _emp_location(jp: dict) -> str:
     loc = jp.get("jobLocation")
@@ -911,7 +911,7 @@ def _emp_date_posted(jp: dict, html_text: str) -> str:
         html_text, re.I
     )
     if m: return m.group(1).strip()
-    # "Publié le : 12/01/2025"
+    # "Published on: 12/01/2025"
     m = re.search(
         r'(?:publi[eé]\s*le\s*:?\s*)(\d{1,2}[/\-\.]\d{1,2}[/\-\.]\d{2,4})',
         html_text, re.I
@@ -927,12 +927,12 @@ def _emp_status(jp: dict, html_text: str) -> str:
     if vt:
         try:
             expiry = datetime.fromisoformat(str(vt).replace("Z", "+00:00"))
-            return "Expiré" if expiry < datetime.now(timezone.utc) else "Actif"
+            return "Expired" if expiry < datetime.now(timezone.utc) else "Active"
         except Exception:
             pass
     if re.search(r'(expir[eé]|clôtur[eé]|fermé|closed|expired)', html_text, re.I):
-        return "Expiré"
-    return "Actif"
+        return "Expired"
+    return "Active"
 
 
 def _emp_contract(jp: dict, html_text: str) -> str:
@@ -952,11 +952,11 @@ def _emp_contract(jp: dict, html_text: str) -> str:
 
 def _emp_remote(jp: dict, html_text: str) -> str:
     jlt = str(jp.get("jobLocationType") or "").lower()
-    if "remote" in jlt or "telecommut" in jlt: return "Oui"
-    if jp.get("applicantLocationRequirements"): return "Oui"
+    if "remote" in jlt or "telecommut" in jlt: return "Yes"
+    if jp.get("applicantLocationRequirements"): return "Yes"
     if re.search(r'\b(t[eé]l[eé]travail|remote|travail\s+[àa]\s+distance)\b', html_text, re.I):
-        return "Oui"
-    return "Non"
+        return "Yes"
+    return "No"
 
 
 def _emp_experience(jp: dict, html_text: str) -> str:
@@ -969,7 +969,7 @@ def _emp_experience(jp: dict, html_text: str) -> str:
         html_text, re.I
     )
     if m: return _emp_clean(m.group(1))
-    # "Confirmé / Expérimenté (3 À 5 Ans)" visible dans la capture
+    # "Confirmed / Experienced (3 To 5 Years)" visible in screenshot
     m = re.search(
         r'((?:D[eé]butant|Junior|Confirm[eé]|Exp[eé]riment[eé]|Senior)'
         r'(?:\s*/\s*(?:D[eé]butant|Junior|Confirm[eé]|Exp[eé]riment[eé]|Senior))?'
@@ -977,7 +977,7 @@ def _emp_experience(jp: dict, html_text: str) -> str:
         html_text, re.I
     )
     if m: return m.group(1).strip()
-    # "3 ans d'expérience"
+    # "3 years of experience"
     m = re.search(
         r"(\d+\s*(?:an[s]?|ann[eé]e[s]?|mois|year[s]?)\s*d['']exp[eé]rience)",
         html_text, re.I
@@ -1008,7 +1008,7 @@ def _emp_skills(jp: dict, html_text: str) -> list[str]:
     elif isinstance(raw, list):
         raw = [_emp_clean(str(s)) for s in raw if s]
     if raw: return [s for s in raw if s]
-    # Fallback : section compétences HTML
+    # Fallback: skills HTML section
     m = re.search(
         r'(?:comp[eé]tences?\s*(?:requises?)?|skills?)\s*:?\s*</?\w+[^>]*>\s*(.*?)(?:</(?:ul|ol|div|section|p)\b)',
         html_text, re.I | re.S
@@ -1050,14 +1050,14 @@ def _emp_tags(jp: dict) -> list[str]:
 
 def _emp_normalize(url: str, html_text: str, jp: dict) -> dict | None:
     """
-    Construit un dict normalisé compatible handle_job() depuis le JSON-LD
-    et le HTML emploitic.
+    Builds a normalized dict compatible with handle_job() from the JSON-LD
+    and emploitic HTML.
 
-    Champs retournés :
-      title, url, company, salary, location, remote, time_ago  ← requis par handle_job
-      _emp_*   ← champs bonus passés directement dans le job dict (évite un re-fetch)
+    Returned fields:
+      title, url, company, salary, location, remote, time_ago  ← required by handle_job
+      _emp_*   ← bonus fields passed directly in the job dict (avoids re-fetching)
     """
-    # ── Titre ──────────────────────────────────────────────────────────────
+    # ── Title ──────────────────────────────────────────────────────────────
     title = _emp_clean(jp.get("title") or jp.get("name") or "")
     if not title:
         m = re.search(r"<h1[^>]*>(.*?)</h1>", html_text, re.S | re.I)
@@ -1068,7 +1068,7 @@ def _emp_normalize(url: str, html_text: str, jp: dict) -> dict | None:
     if not title:
         return None
 
-    # ── Société ──────────────────────────────────────────────────────────────
+    # ── Company ──────────────────────────────────────────────────────────────
     company = ""
     org = jp.get("hiringOrganization")
     if isinstance(org, dict):
@@ -1080,7 +1080,7 @@ def _emp_normalize(url: str, html_text: str, jp: dict) -> dict | None:
         )
         if m: company = _emp_clean(m.group(1))
 
-    # ── Lieu ──────────────────────────────────────────────────────────────────
+    # ── Location ──────────────────────────────────────────────────────────────
     location = _emp_location(jp)
     if not location:
         m = re.search(
@@ -1089,16 +1089,16 @@ def _emp_normalize(url: str, html_text: str, jp: dict) -> dict | None:
         )
         if m: location = _emp_clean(m.group(1))
     if not location:
-        location = "Algérie"
+        location = "Algeria"
 
-    # ── Salaire ───────────────────────────────────────────────────────────────
-    salary = _emp_salary(jp) or "Non spécifié"
+    # ── Salary ───────────────────────────────────────────────────────────────
+    salary = _emp_salary(jp) or "not specified"
 
-    # ── Date de publication ───────────────────────────────────────────────────
+    # ── Publication date ───────────────────────────────────────────────────────
     date_str = _emp_date_posted(jp, html_text)
     pub_dt   = _emp_parse_date(date_str) if date_str else None
 
-    # Fallback HTML visible : "Aujourd'hui", "Hier", "Il y a X jours"
+    # Fallback visible HTML: "Today", "Yesterday", "X days ago"
     if pub_dt is None:
         m = re.search(
             r"(Aujourd['']hui|Hier|Il\s+y\s+a\s+\d+\s+(?:jours?|semaines?|mois|ans?))",
@@ -1106,7 +1106,7 @@ def _emp_normalize(url: str, html_text: str, jp: dict) -> dict | None:
         )
         if m: pub_dt = _emp_parse_date(m.group(1))
 
-    # ── Champs enrichis ───────────────────────────────────────────────────────
+    # ── Enriched fields ───────────────────────────────────────────────────────
     status     = _emp_status(jp, html_text)
     contract   = _emp_contract(jp, html_text)
     remote_val = _emp_remote(jp, html_text)
@@ -1118,7 +1118,7 @@ def _emp_normalize(url: str, html_text: str, jp: dict) -> dict | None:
     description= _emp_clean(str(jp.get("description") or ""))[:2000]
 
     return {
-        # ── Champs requis par handle_job() ────────────────────────────────
+        # ── Fields required by handle_job() ────────────────────────────────
         "title":    title,
         "url":      url,
         "company":  company,
@@ -1126,8 +1126,8 @@ def _emp_normalize(url: str, html_text: str, jp: dict) -> dict | None:
         "location": location,
         "remote":   remote_val,
         "time_ago": _emp_age_label(pub_dt),
-        # ── Champs enrichis directement disponibles ───────────────────────
-        # (enrich() dans main.py peut les utiliser sans re-fetch)
+        # ── Enriched fields directly available ───────────────────────────
+        # (enrich() in main.py can use them without re-fetching)
         "_emp_pub_dt":    pub_dt,
         "_emp_status":    status,
         "_emp_contract":  contract,
@@ -1140,26 +1140,26 @@ def _emp_normalize(url: str, html_text: str, jp: dict) -> dict | None:
     }
 
 
-# ── Point d'entrée emploitic ──────────────────────────────────────────────────
+# ── Emploitic entry point ──────────────────────────────────────────────────────
 
 
 def _emp_title_from_slug(url: str) -> str:
     """
-    Extrait un titre approximatif depuis le slug de l'URL emploitic.
-    Permet le filtre cosine AVANT de fetcher la page (évite 1.5s × N fetches inutiles).
+    Extracts an approximate title from the emploitic URL slug.
+    Allows cosine filtering BEFORE fetching the page (avoids 1.5s × N useless fetches).
 
-    Exemples :
+    Examples:
       /offres-d-emploi/data-engineer-chez-techcorp-123456  → "data engineer"
       /offres-d-emploi/developpeur-fullstack-react-nodejs-987654 → "developpeur fullstack react nodejs"
       /offres-d-emploi/ingenieur-machine-learning-456789  → "ingenieur machine learning"
     """
     try:
         slug = url.rstrip("/").split("/")[-1]
-        # Supprimer l'ID numérique en fin (toujours présent sur emploitic)
+        # Remove trailing numeric ID (always present on emploitic)
         slug = re.sub(r"-\d+$", "", slug)
-        # Supprimer "chez-..." (nom de société encodé dans le slug)
+        # Remove "chez-..." (company name encoded in the slug)
         slug = re.sub(r"-chez-.+$", "", slug, flags=re.I)
-        # Tirets → espaces
+        # Hyphens → spaces
         title = slug.replace("-", " ").strip()
         return title if len(title) >= 3 else ""
     except Exception:
@@ -1168,108 +1168,108 @@ def _emp_title_from_slug(url: str) -> str:
 
 async def scrape_emploitic(query: str, session: aiohttp.ClientSession) -> list[dict]:
     """
-    Scrape emploitic.com via sitemap XML + JSON-LD JobPosting.
+    Scrapes emploitic.com via XML sitemap + JSON-LD JobPosting.
 
-    Logique identique aux autres scrapers :
-      - STOP immédiat dès qu'un job > 45 jours (les suivants sont plus vieux)
-      - Délai poli 1.5s entre requêtes
-      - Limite 50 jobs
-      - Retourne des dicts compatibles handle_job() de main.py
+    Same logic as other scrapers:
+      - Immediate STOP as soon as a job is > 45 days old (the following ones are older)
+      - Polite 1.5s delay between requests
+      - Limit of 50 jobs
+      - Returns dicts compatible with handle_job() in main.py
     """
-    print(f"  [emploitic] Démarrage pour '{query}'")
+    print(f"  [emploitic] Starting for '{query}'")
 
     # ── 1. Sitemap index ──────────────────────────────────────────────────────
     index_text = await _emp_fetch(f"{EMPLOITIC_BASE}/sitemap.xml", session, is_xml=True)
     if not index_text:
-        print(f"  [emploitic] Impossible de lire sitemap.xml")
+        print(f"  [emploitic] Unable to read sitemap.xml")
         return []
 
     sub_sitemaps = _emp_parse_sitemap_index(index_text)
     if not sub_sitemaps:
-        print(f"  [emploitic] Aucun sous-sitemap trouvé")
+        print(f"  [emploitic] No sub-sitemap found")
         return []
-    print(f"  [emploitic] {len(sub_sitemaps)} sous-sitemaps : {sub_sitemaps[:2]}")
+    print(f"  [emploitic] {len(sub_sitemaps)} sub-sitemaps: {sub_sitemaps[:2]}")
 
-    # ── 2. Sitemap jobs ───────────────────────────────────────────────────────
+    # ── 2. Jobs sitemap ───────────────────────────────────────────────────────
     job_entries: list[tuple[str, datetime | None]] = []
 
     for sm_url in sub_sitemaps:
         await asyncio.sleep(0.5)
         sm_text = await _emp_fetch(sm_url, session, is_xml=True)
         if not sm_text:
-            print(f"  [emploitic] Impossible de lire {sm_url[:60]}")
+            print(f"  [emploitic] Unable to read {sm_url[:60]}")
             continue
         entries = _emp_parse_job_sitemap(sm_text)
         job_entries.extend(entries)
-        print(f"  [emploitic] {sm_url.split('/')[-1]}: {len(entries)} URLs jobs")
+        print(f"  [emploitic] {sm_url.split('/')[-1]}: {len(entries)} job URLs")
         if job_entries:
-            break   # sitemap jobs trouvé → on arrête
+            break   # jobs sitemap found → stop here
 
     if not job_entries:
-        print(f"  [emploitic] Aucune URL /offres-d-emploi/ trouvée")
+        print(f"  [emploitic] No /offres-d-emploi/ URL found")
         return []
-    print(f"  [emploitic] {len(job_entries)} URLs (triées plus récent → plus vieux)")
+    print(f"  [emploitic] {len(job_entries)} URLs (sorted newest → oldest)")
 
-    # ── 3. Scraper les pages jobs ─────────────────────────────────────────────
-    # Stratégie accélérée :
-    #   a) Extraire le titre depuis le slug de l'URL (gratuit, 0ms)
-    #   b) Retourner un job "léger" avec slug_title pour filtre cosine dans main.py
-    #   c) Si cosine < seuil emploitic (0.55) → main.py skippe sans jamais fetch la page
-    #   d) Sinon → main.py appelle extract_with_llm qui fetche la page (HTML complet)
-    # Résultat : on évite 0.3s × chaque job non-pertinent
+    # ── 3. Scrape job pages ───────────────────────────────────────────────────
+    # Accelerated strategy:
+    #   a) Extract title from URL slug (free, 0ms)
+    #   b) Return a "lightweight" job with slug_title for cosine filter in main.py
+    #   c) If cosine < emploitic threshold (0.55) → main.py skips without ever fetching the page
+    #   d) Otherwise → main.py calls extract_with_llm which fetches the full HTML
+    # Result: avoids 0.3s × each irrelevant job
 
     listings:        list[dict] = []
     skipped_no_date: int        = 0
 
     for idx, (url, lastmod) in enumerate(job_entries):
-        # ── SKIP sur lastmod trop vieux ────────────────────────────────────
+        # ── SKIP if lastmod is too old ─────────────────────────────────────
         if lastmod is not None:
             days_old = (datetime.now() - lastmod).days
             if days_old > MAX_AGE_DAYS:
                 print(
-                    f"  [emploitic] SKIP sitemap {days_old}d > {MAX_AGE_DAYS}d : "
+                    f"  [emploitic] SKIP sitemap {days_old}d > {MAX_AGE_DAYS}d: "
                     f"{url.split('/')[-1][:40]}"
                 )
                 continue
         else:
             skipped_no_date += 1
 
-        # ── Titre depuis le slug (0ms, pas de fetch) ──────────────────────
-        # Permet au filtre cosine de main.py de décider AVANT le fetch
+        # ── Title from slug (0ms, no fetch) ───────────────────────────────
+        # Allows cosine filter in main.py to decide BEFORE fetching
         slug_title = _emp_title_from_slug(url)
         if not slug_title:
-            # Slug illisible → on fetche quand même
+            # Unreadable slug → fetch anyway
             slug_title = ""
 
-        # Retourner un job léger : main.py fera le fetch via extract_with_llm
-        # seulement si cosine(slug_title, cv_title) >= seuil emploitic (0.55)
-        # Les champs _emp_* sont vides ici → remplis par extract_with_llm
+        # Return a lightweight job: main.py will fetch via extract_with_llm
+        # only if cosine(slug_title, cv_title) >= emploitic threshold (0.55)
+        # _emp_* fields are empty here → filled by extract_with_llm
         job_light = {
             "title":            slug_title or url.split("/")[-1].replace("-", " "),
             "url":              url,
             "company":          "",
             "location":         "",
-            "salary":           "Non spécifié",
+            "salary":           "Not specified",
             "remote":           "",
             "time_ago":         _emp_age_label(lastmod) if lastmod else "",
             "_emp_pub_dt":      lastmod,
-            # Flag pour main.py : emploitic = fetch complet via extract_with_llm
+            # Flag for main.py: emploitic = full fetch via extract_with_llm
             "_emp_needs_fetch": True,
         }
         listings.append(job_light)
 
     if skipped_no_date:
-        print(f"  [emploitic] {skipped_no_date} jobs sans date dans le sitemap ignorés")
-    print(f"[emploitic] TOTAL pré-filtre: {len(listings)} (filtre cosine 0.55 dans main.py)")
+        print(f"  [emploitic] {skipped_no_date} jobs with no sitemap date skipped")
+    print(f"[emploitic] TOTAL pre-filter: {len(listings)} (cosine filter 0.55 in main.py)")
     return listings
 
 
 async def _scrape_emploitic_fetch_one(url: str, session: aiohttp.ClientSession) -> dict | None:
     """
-    Fetch et extrait les données complètes d'un job emploitic.
-    Appelé par enrich() dans main.py UNIQUEMENT si cosine >= 0.55.
-    Remplace extract_with_llm pour emploitic (pas besoin de LLM,
-    les données sont dans le JSON-LD de la page).
+    Fetches and extracts full data for one emploitic job.
+    Called by enrich() in main.py ONLY if cosine >= 0.55.
+    Replaces extract_with_llm for emploitic (no LLM needed,
+    data is available in the page's JSON-LD).
     """
     html_text = await _emp_fetch(url, session, is_xml=False)
     if not html_text:
@@ -1277,10 +1277,6 @@ async def _scrape_emploitic_fetch_one(url: str, session: aiohttp.ClientSession) 
     jp  = _emp_find_jobposting(_emp_extract_jsonld_objects(html_text)) or {}
     job = _emp_normalize(url, html_text, jp)
     return job
-
-
-
-
 
 # ══════════════════════════════════════════════════════════════════════════════
 #  4.  tanitjobs.com

@@ -193,6 +193,17 @@ CREATE INDEX IF NOT EXISTS idx_jobs_url ON jobs(url);
 -- Index GIN sur id_user pour les recherches par user
 CREATE INDEX IF NOT EXISTS idx_jobs_id_user ON jobs USING GIN(id_user);
 
+-- ── Table chat_history ────────────────────────────────────────────────────────
+-- Stocke l'historique des conversations Career Assistant
+CREATE TABLE IF NOT EXISTS chat_history (
+    id         SERIAL PRIMARY KEY,
+    user_id    INTEGER NOT NULL,
+    role       TEXT NOT NULL,    -- "user" | "assistant"
+    content    TEXT NOT NULL,
+    created_at TIMESTAMP DEFAULT NOW()
+);
+CREATE INDEX IF NOT EXISTS idx_chat_history_user_id ON chat_history(user_id);
+
 -- ── Fonction trigger ─────────────────────────────────────────────────────────
 CREATE OR REPLACE FUNCTION fn_jobs_upsert()
 RETURNS TRIGGER AS $$
@@ -588,3 +599,52 @@ async def user_has_jobs(user_id: int) -> bool:
     except Exception as e:
         logger.error(f"[db] user_has_jobs failed for user_id={user_id}: {e}")
         return False
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+#  Chat History (Career Assistant)
+# ─────────────────────────────────────────────────────────────────────────────
+
+async def save_chat_message(user_id: int, role: str, content: str) -> bool:
+    """
+    Sauvegarde un message dans l'historique de chat.
+    role = "user" | "assistant"
+    """
+    pool = await get_pool()
+    try:
+        async with pool.acquire() as conn:
+            await conn.execute(
+                "INSERT INTO chat_history (user_id, role, content) VALUES ($1, $2, $3)",
+                user_id, role, content,
+            )
+        logger.info(f"[db] save_chat_message OK — user_id={user_id} role={role}")
+        return True
+    except Exception as e:
+        logger.error(f"[db] save_chat_message failed for user_id={user_id}: {e}")
+        return False
+
+
+async def load_chat_history(user_id: int, limit: int = 50) -> list[dict]:
+    """
+    Retourne l'historique de chat d'un utilisateur (ordre chronologique).
+    """
+    pool = await get_pool()
+    try:
+        async with pool.acquire() as conn:
+            rows = await conn.fetch(
+                """
+                SELECT role, content, created_at
+                FROM chat_history
+                WHERE user_id = $1
+                ORDER BY created_at ASC
+                LIMIT $2
+                """,
+                user_id, limit,
+            )
+        result = [{"role": r["role"], "content": r["content"]} for r in rows]
+        logger.info(f"[db] load_chat_history: {len(result)} messages for user_id={user_id}")
+        return result
+    except Exception as e:
+        logger.error(f"[db] load_chat_history failed for user_id={user_id}: {e}")
+        return []
+    
