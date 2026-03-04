@@ -33,17 +33,25 @@ import {
 // ─────────────────────────────────────────────────────────────────────────────
 
 interface Job {
-  url: string; source: string; title: string; company: string;
+  url: string; source: string; title: string; industry: string;
   location: string; remote: string; salary: string; contract: string;
   education: string; experience: string; description: string;
   skills_req: string; skills_bon: string;
-  cosine_score: number; match_score: number;
+  cosine: number;        // clé réelle backend (0–1 DB, ou ×100 SSE)
+  cosine_score?: number; // alias legacy
+  match_score: number;
   gap_missing: string[]; gap_matched?: string[];
   gap_coverage?: number; gap_total: number;
   xai?: {
     cosine_score: number; match_score: number;
     explanations: string[]; score_formula: string; interpretation: string;
   };
+}
+
+// Normalise score 0–1 (DB) ou 0–100 (SSE) → toujours 0–1
+function normalizeScore(v: number | undefined | null): number {
+  if (!v) return 0;
+  return v > 1 ? v / 100 : v;
 }
 
 interface RoadmapItem {
@@ -61,14 +69,18 @@ type Tab = "matches" | "gap" | "roadmap" | "market" | "report";
 
 function ScoreBars({ job }: { job: Job }) {
   return (
-    <div style={{ display: "flex", flexDirection: "column", gap: 5, margin: "8px 0" }}>
+    <div style={{ display: "flex", flexDirection: "column", gap: 6, margin: "8px 0" }}>
       {[
-        { label: "Cosine",   value: job.cosine_score || 0 },
-        { label: "AI Match", value: job.match_score  || 0 },
-      ].map(({ label, value }) =>
+        { label: "Title Match", sub: "cosine",   value: normalizeScore(job.cosine ?? job.cosine_score) },
+        { label: "AI Match",    sub: "biencoder", value: normalizeScore(job.match_score) },
+      ].map(({ label, sub, value }) =>
         value > 0 ? (
           <div key={label} style={{ display: "flex", alignItems: "center", gap: 8 }}>
-            <span style={{ fontSize: 9, color: C.muted, width: 52, flexShrink: 0, fontFamily: MONO, textTransform: "uppercase" }}>{label}</span>
+            {/* Label + sub */}
+            <div style={{ width: 68, flexShrink: 0 }}>
+              <div style={{ fontSize: 9, color: C.muted, fontFamily: MONO, textTransform: "uppercase", fontWeight: 700, lineHeight: 1.2 }}>{label}</div>
+              <div style={{ fontSize: 8, color: "#b8aece", fontFamily: MONO, lineHeight: 1.2 }}>{sub}</div>
+            </div>
             <div style={{ flex: 1, height: 4, background: C.border, borderRadius: 2, overflow: "hidden" }}>
               <div style={{ width: `${value * 100}%`, height: "100%", background: scoreColor(value), borderRadius: 2, transition: "width .5s" }} />
             </div>
@@ -86,13 +98,35 @@ function ScoreBars({ job }: { job: Job }) {
 //  JobCard — full or mini variant
 // ─────────────────────────────────────────────────────────────────────────────
 
-function JobCard({ job }: { job: Job }) {
-  const [expanded, setExpanded] = useState(false);
-  const [showXAI,  setShowXAI]  = useState(false);
+// ── Dérive l'interprétation depuis le score si xai absent ────────────────────
+function scoreToInterp(score: number): string {
+  if (score >= 0.75) return "excellent";
+  if (score >= 0.55) return "good";
+  if (score >= 0.40) return "moderate";
+  return "low";
+}
 
-  const score = job.match_score || job.cosine_score || 0;
+// ── Commentaire sous le badge — toujours affiché ─────────────────────────────
+
+
+function JobCard({ job }: { job: Job }) {
+  const [expanded,    setExpanded]    = useState(false);
+  const [showXAI,     setShowXAI]     = useState(false);
+  const [showAllGap,  setShowAllGap]  = useState(false);  // ← +N cliquable
+
+  const score = normalizeScore(job.match_score) || normalizeScore(job.cosine ?? job.cosine_score) || 0;
   const col   = scoreColor(score);
-  const b     = job.xai ? interpBadge(job.xai.interpretation) : null;
+  const interp = job.xai?.interpretation ?? scoreToInterp(score);
+  const b      = interpBadge(interp);
+
+  // Skills gap helpers
+  const missingAll    = job.gap_missing || [];
+  const matchedAll    = job.gap_matched || [];
+  const PREVIEW_MISS  = 3;
+  const PREVIEW_MATCH = 2;
+  const extraMissing  = missingAll.length - PREVIEW_MISS;
+  const visibleMissing = showAllGap ? missingAll : missingAll.slice(0, PREVIEW_MISS);
+  const visibleMatched = showAllGap ? matchedAll : matchedAll.slice(0, PREVIEW_MATCH);
 
   return (
     <div style={{
@@ -105,14 +139,14 @@ function JobCard({ job }: { job: Job }) {
       <div style={{ display: "flex", gap: 10, alignItems: "flex-start" }}>
         {/* Company avatar */}
         <div style={{ width: 34, height: 34, borderRadius: 8, flexShrink: 0, background: GRAD, display: "flex", alignItems: "center", justifyContent: "center", fontWeight: 800, fontSize: 13, color: "#fff" }}>
-          {(job.company || job.title || "?").charAt(0).toUpperCase()}
+          {(job.industry || job.title || "?").charAt(0).toUpperCase()}
         </div>
         {/* Title + company */}
         <div style={{ flex: 1, minWidth: 0 }}>
           <div style={{ fontSize: 12, fontWeight: 700, color: C.text, lineHeight: 1.3 }}>{job.title}</div>
-          <div style={{ fontSize: 10, color: C.muted, marginTop: 2 }}>{job.company || "—"}</div>
+          <div style={{ fontSize: 10, color: C.muted, marginTop: 2 }}>{job.industry || "—"}</div>
         </div>
-        {/* Score badge */}
+        {/* Score + badge + commentaire */}
         <div style={{ textAlign: "right", flexShrink: 0 }}>
           <div style={{ fontSize: 16, fontWeight: 800, color: col, fontFamily: MONO, lineHeight: 1 }}>
             {(score * 100).toFixed(1)}%
@@ -122,7 +156,8 @@ function JobCard({ job }: { job: Job }) {
               {b.label}
             </span>
           )}
-          <div style={{ fontSize: 9, color: "#9f8fb0", fontFamily: MONO }}>{job.source}</div>
+          {/* Commentaire sous badge — toujours visible, dérive de xai ou du score */}
+          <div style={{ fontSize: 9, color: "#9f8fb0", fontFamily: MONO, marginTop: 2 }}>{job.source}</div>
         </div>
       </div>
 
@@ -135,59 +170,176 @@ function JobCard({ job }: { job: Job }) {
         )}
       </div>
 
-      {/* ── Score bars ── */}
+      {/* ── Score bars (Cosine + AI Match) ── */}
       <ScoreBars job={job} />
 
-      {/* ── Skills gap ── */}
+      {/* ── Skills gap avec +N cliquable ── */}
       {job.gap_total > 0 && (
         <div style={{ borderTop: `1px solid ${C.border}`, paddingTop: 7 }}>
           <div style={{ display: "flex", justifyContent: "space-between", marginBottom: 4 }}>
             <span style={{ fontSize: 9, color: C.muted, textTransform: "uppercase", letterSpacing: "0.06em" }}>
               Skills Gap
             </span>
-            <span style={{ fontSize: 9, fontWeight: 700, color: job.gap_missing.length === 0 ? "#22c55e" : "#f59e0b" }}>
-              {job.gap_total - job.gap_missing.length}/{job.gap_total} covered
+            <span style={{ fontSize: 9, fontWeight: 700, color: missingAll.length === 0 ? C.green : C.amber }}>
+              {job.gap_total - missingAll.length}/{job.gap_total} covered
             </span>
           </div>
           <div style={{ display: "flex", flexWrap: "wrap", gap: 3 }}>
-            {job.gap_missing.slice(0, 3).map(s => (
+            {/* Missing skills (rouges) */}
+            {visibleMissing.map(s => (
               <span key={s} style={{ fontSize: 9, padding: "1px 6px", borderRadius: 4, background: "rgba(220,38,38,.07)", color: C.red, border: "1px solid rgba(220,38,38,.2)" }}>{s}</span>
             ))}
-            {(job.gap_matched || []).slice(0, 2).map(s => (
+            {/* Matched skills (verts) */}
+            {visibleMatched.map(s => (
               <span key={s} style={{ fontSize: 9, padding: "1px 6px", borderRadius: 4, background: "rgba(22,163,74,.07)", color: C.green, border: "1px solid rgba(22,163,74,.2)" }}>✓ {s}</span>
             ))}
-            {job.gap_missing.length > 3 && (
-              <span style={{ fontSize: 9, padding: "1px 6px", borderRadius: 4, background: C.border, color: C.muted }}>
-                +{job.gap_missing.length - 3}
-              </span>
+            {/* ← CORRIGÉ : +N cliquable → expand toutes les skills */}
+            {!showAllGap && extraMissing > 0 && (
+              <button
+                onClick={() => setShowAllGap(true)}
+                style={{ fontSize: 9, padding: "1px 6px", borderRadius: 4, background: "rgba(217,119,6,.10)", color: C.amber, border: "1px solid rgba(217,119,6,.3)", fontFamily: MONO, fontWeight: 700, cursor: "pointer" }}
+              >
+                +{extraMissing}
+              </button>
+            )}
+            {/* Bouton collapse */}
+            {showAllGap && extraMissing > 0 && (
+              <button
+                onClick={() => setShowAllGap(false)}
+                style={{ fontSize: 9, padding: "1px 6px", borderRadius: 4, background: C.light, color: C.muted, border: `1px solid ${C.border}`, fontFamily: MONO, fontWeight: 700, cursor: "pointer" }}
+              >
+                ▲ less
+              </button>
             )}
           </div>
         </div>
       )}
 
-      {/* ── XAI toggle ── */}
-      {job.xai && (
-        <>
-          <button onClick={() => setShowXAI(!showXAI)} style={{ background: "transparent", border: `1px solid ${col}44`, borderRadius: 6, color: col, fontSize: 10, padding: "4px 8px", cursor: "pointer", fontFamily: MONO, textAlign: "left" }}>
-            {showXAI ? "▲ Hide explanation" : "🔍 Explain scores (XAI)"}
-          </button>
-          {showXAI && (
-            <div style={{ background: C.bg, border: `1px solid ${C.border}`, borderRadius: 10, padding: "12px 14px" }}>
-              <div style={{ display: "flex", alignItems: "center", gap: 8, marginBottom: 10 }}>
-                <span style={{ fontSize: 12, fontWeight: 700, color: C.text }}>🔍 Score Explanation</span>
-                <span style={{ fontSize: 10, padding: "2px 8px", borderRadius: 4, background: interpBadge(job.xai.interpretation).bg, color: interpBadge(job.xai.interpretation).color, fontWeight: 700 }}>
-                  {interpBadge(job.xai.interpretation).label}
-                </span>
-              </div>
-              {job.xai.explanations.map((e, i) => (
-                <div key={i} style={{ fontSize: 11, color: "#4a3f60", lineHeight: 1.5, padding: "4px 8px", background: C.bg, borderRadius: 6, marginBottom: 4 }}>{e}</div>
-              ))}
-            </div>
-          )}
-        </>
-      )}
+      {/* ── Explain scores — toujours visible, juste sous skills gap ── */}
+      <div style={{ borderTop: `1px solid ${C.border}`, paddingTop: 8 }}>
+        <button
+          onClick={() => setShowXAI(!showXAI)}
+          style={{
+            background: showXAI ? `${col}0d` : "transparent",
+            border: `1px solid ${col}44`, borderRadius: 6, color: col,
+            fontSize: 10, padding: "4px 10px", cursor: "pointer",
+            fontFamily: MONO, textAlign: "left", width: "100%",
+            transition: "background .2s",
+          }}
+        >
+          {showXAI ? "▲ Hide explanation" : "🔍 Explain scores (XAI)"}
+        </button>
 
-      {/* ── Expanded details ── */}
+        {showXAI && (
+          <div style={{ marginTop: 8, background: C.light, border: `1px solid ${C.border}`, borderRadius: 10, padding: "12px 14px" }}>
+            {/* Header */}
+            <div style={{ display: "flex", alignItems: "center", gap: 8, marginBottom: 10 }}>
+              <span style={{ fontSize: 12, fontWeight: 700, color: C.text }}>Score Explanation</span>
+              <span style={{ fontSize: 10, padding: "2px 8px", borderRadius: 4, background: b.bg, color: b.color, fontWeight: 700 }}>
+                {b.label}
+              </span>
+            </div>
+
+            {/* ── Ligne 1 : Cosine Similarity = Title Match ── */}
+            {(() => {
+              const cosP  = normalizeScore(job.xai?.cosine_score ?? job.cosine ?? job.cosine_score);
+              const cosCol = scoreColor(cosP);
+              return (
+                <div style={{ display: "flex", alignItems: "flex-start", gap: 10, padding: "7px 10px", background: C.white, borderRadius: 8, marginBottom: 6, border: `1px solid ${C.border}` }}>
+                  <div style={{ minWidth: 130 }}>
+                    <div style={{ fontSize: 10, fontWeight: 700, color: C.muted, textTransform: "uppercase", letterSpacing: "0.06em", fontFamily: MONO, marginBottom: 4 }}>
+                      🎯 Cosine Similarity
+                    </div>
+                    {/* Mini bar */}
+                    <div style={{ height: 4, borderRadius: 99, background: C.border, overflow: "hidden", marginBottom: 3 }}>
+                      <div style={{ height: "100%", width: `${cosP * 100}%`, background: cosCol, borderRadius: 99 }} />
+                    </div>
+                    <span style={{ fontSize: 12, fontWeight: 800, color: cosCol, fontFamily: MONO }}>
+                      {(cosP * 100).toFixed(1)}%
+                    </span>
+                  </div>
+                  <div style={{ fontSize: 11, color: "#4a3f60", lineHeight: 1.55, paddingTop: 2 }}>
+                    <strong style={{ color: C.text }}>Title Match</strong> —{" "}
+                    {cosP >= 0.75
+                      ? "Your job title strongly aligns with this role. The semantic similarity between your profile and the job title is excellent."
+                      : cosP >= 0.55
+                      ? "Your profile partially matches the job title. Some overlap exists but your title may differ slightly."
+                      : "Limited title overlap. Your current title differs from this role — consider tailoring your headline."}
+                  </div>
+                </div>
+              );
+            })()}
+
+            {/* ── Ligne 2 : AI Match = BiEncoder score ── */}
+            {(() => {
+              const aiP   = normalizeScore(job.xai?.match_score ?? job.match_score);
+              const aiCol = scoreColor(aiP);
+              return (
+                <div style={{ display: "flex", alignItems: "flex-start", gap: 10, padding: "7px 10px", background: C.white, borderRadius: 8, marginBottom: 6, border: `1px solid ${C.border}` }}>
+                  <div style={{ minWidth: 130 }}>
+                    <div style={{ fontSize: 10, fontWeight: 700, color: C.muted, textTransform: "uppercase", letterSpacing: "0.06em", fontFamily: MONO, marginBottom: 4 }}>
+                      🤖 AI Match
+                    </div>
+                    <div style={{ height: 4, borderRadius: 99, background: C.border, overflow: "hidden", marginBottom: 3 }}>
+                      <div style={{ height: "100%", width: `${aiP * 100}%`, background: aiCol, borderRadius: 99 }} />
+                    </div>
+                    <span style={{ fontSize: 12, fontWeight: 800, color: aiCol, fontFamily: MONO }}>
+                      {(aiP * 100).toFixed(1)}%
+                    </span>
+                  </div>
+                  <div style={{ fontSize: 11, color: "#4a3f60", lineHeight: 1.55, paddingTop: 2 }}>
+                    <strong style={{ color: C.text }}>BiEncoder Score</strong> —{" "}
+                    {job.xai?.explanations?.[0]
+                      ? job.xai.explanations[0]
+                      : aiP >= 0.75
+                      ? "Excellent overall fit. Your experience, skills and profile strongly match the job requirements."
+                      : aiP >= 0.55
+                      ? "Good fit. Your profile covers most requirements — a few gaps exist."
+                      : "Moderate fit. Your profile meets some criteria but key requirements may be missing."}
+                  </div>
+                </div>
+              );
+            })()}
+
+            {/* ── Ligne 3 : Skills Coverage ── */}
+            {job.gap_total > 0 && (() => {
+              const covered = job.gap_total - missingAll.length;
+              const pct     = Math.round(covered / job.gap_total * 100);
+              const covCol  = pct >= 70 ? C.green : pct >= 40 ? C.amber : C.red;
+              return (
+                <div style={{ display: "flex", alignItems: "flex-start", gap: 10, padding: "7px 10px", background: C.white, borderRadius: 8, marginBottom: 4, border: `1px solid ${C.border}` }}>
+                  <div style={{ minWidth: 130 }}>
+                    <div style={{ fontSize: 10, fontWeight: 700, color: C.muted, textTransform: "uppercase", letterSpacing: "0.06em", fontFamily: MONO, marginBottom: 4 }}>
+                      📊 Skills Coverage
+                    </div>
+                    <div style={{ height: 4, borderRadius: 99, background: C.border, overflow: "hidden", marginBottom: 3 }}>
+                      <div style={{ height: "100%", width: `${pct}%`, background: covCol, borderRadius: 99 }} />
+                    </div>
+                    <span style={{ fontSize: 12, fontWeight: 800, color: covCol, fontFamily: MONO }}>
+                      {covered}/{job.gap_total}
+                    </span>
+                  </div>
+                  <div style={{ fontSize: 11, color: "#4a3f60", lineHeight: 1.55, paddingTop: 2 }}>
+                    <strong style={{ color: C.text }}>{pct}% covered</strong> —{" "}
+                    {missingAll.length === 0
+                      ? "You meet all required skills for this role. 🎉"
+                      : `Missing: ${missingAll.slice(0, 4).join(", ")}${missingAll.length > 4 ? ` +${missingAll.length - 4} more` : ""}.`}
+                  </div>
+                </div>
+              );
+            })()}
+
+            {/* ── Textes XAI supplémentaires du backend (si présents) ── */}
+            {job.xai?.explanations?.slice(1).map((e, i) => (
+              <div key={i} style={{ fontSize: 10, color: C.muted, lineHeight: 1.5, padding: "4px 8px", background: C.bg, borderRadius: 6, marginTop: 4, fontFamily: MONO, fontStyle: "italic" }}>
+                {e}
+              </div>
+            ))}
+          </div>
+        )}
+      </div>
+
+      {/* ── Expanded details (More details) ── */}
       {expanded && (
         <div style={{ borderTop: `1px solid ${C.border}`, paddingTop: 8, display: "flex", flexDirection: "column", gap: 6 }}>
           {job.skills_req && (
@@ -383,22 +535,40 @@ function ChatSidebar({ userId }: { userId: number }) {
   const [msgs,    setMsgs]    = useState<Message[]>([]);
   const [input,   setInput]   = useState("");
   const [loading, setLoading] = useState(false);
+  const [chatErr, setChatErr] = useState("");
   const endRef = useRef<HTMLDivElement>(null);
+
+  // Load chat history on mount
+  useEffect(() => {
+    if (!userId) return;
+    fetch(`/api/chat/history?user_id=${userId}`)
+      .then(r => r.json())
+      .then(d => { if (d.messages?.length) setMsgs(d.messages); })
+      .catch(() => {});
+  }, [userId]);
 
   useEffect(() => { endRef.current?.scrollIntoView({ behavior: "smooth" }); }, [msgs]);
 
   async function send() {
-    if (!input.trim()) return;
-    const msg = input.trim(); setInput("");
+    const msg = input.trim();
+    if (!msg) return;
+    setInput(""); setChatErr("");
     setMsgs(p => [...p, { role: "user", content: msg }]);
     setLoading(true);
     try {
       const r = await fetch("/api/chat", {
         method: "POST", headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({ user_id: userId, message: msg }),
+        body: JSON.stringify({ user_id: String(userId), message: msg }),
       });
+      if (!r.ok) { setChatErr(`Server error ${r.status}`); return; }
       const d = await r.json();
-      setMsgs(p => [...p, { role: "assistant", content: d.response }]);
+      if (d.response) {
+        setMsgs(p => [...p, { role: "assistant", content: d.response }]);
+      } else {
+        setChatErr("Empty response from server.");
+      }
+    } catch (e) {
+      setChatErr("Connection error — is the backend running?");
     } finally { setLoading(false); }
   }
 
@@ -433,6 +603,7 @@ function ChatSidebar({ userId }: { userId: number }) {
           </div>
         ))}
         {loading && <div style={{ fontSize: 11, color: "#9f8fb0", padding: "6px 12px" }}>Thinking…</div>}
+        {chatErr && <div style={{ fontSize: 11, color: C.red, padding: "4px 12px" }}>⚠ {chatErr}</div>}
         <div ref={endRef} />
       </div>
 
@@ -620,14 +791,48 @@ function Dashboard() {
     loadJobs();
   }
 
-  async function loadJobs() {
-    setJobsLoad(true);
-    try {
-      const r = await fetch("/api/matches", { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ user_id: userId, role: roleFilter, location: locFilter, min_fit: minFit }) });
-      const d = await r.json();
-      setJobs(d.matches || []);
-    } finally { setJobsLoad(false); }
+async function loadJobs() {
+  setJobsLoad(true);
+  try {
+    const resp = await fetch(`/jobs/${userId}`);
+    if (!resp.ok || !resp.body) return;
+
+    const reader  = resp.body.getReader();
+    const decoder = new TextDecoder();
+    let buf = "";
+    const loaded: Job[] = [];
+
+    while (true) {
+      const { done, value } = await reader.read();
+      if (done) break;
+      buf += decoder.decode(value, { stream: true });
+
+      const chunks = buf.split("\n\n");
+      buf = chunks.pop() || "";
+
+      for (const chunk of chunks) {
+        if (!chunk.startsWith("data: ")) continue;
+        let d: any;
+        try { d = JSON.parse(chunk.slice(6)); } catch { continue; }
+
+        if (d.event === "no_cache") {
+          // Aucun job en DB pour cet utilisateur
+          break;
+        }
+        if (d.event === "job") {
+          loaded.push(d as Job);
+        }
+        if (d.event === "done") {
+          setJobs(loaded);
+          break;
+        }
+      }
+    }
+    setJobs(loaded);  // sécurité si "done" pas reçu
+  } finally {
+    setJobsLoad(false);
   }
+}
 
   async function loadGap() {
     setGapLoad(true);
