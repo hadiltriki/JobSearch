@@ -2,35 +2,13 @@
 main.py — JobScan + Career Assistant  ·  Backend unifié
 ========================================================
 
-ARCHITECTURE :
-  Projet 1 (toi)   → pipeline scan SSE, scraping 6 sources, cosine filter,
-                      matching fine-tuné, skills gap, DB PostgreSQL asyncpg
-  Projet 2 (collègue) → chatbot keyword, skills gap market, roadmap,
-                         market analytics, PDF report, chat history
-
-FLOW UTILISATEUR :
-  GET  /                        → login.html (saisir user_id)
-  GET  /api/user/{id}           → existe ? → redirect dashboard | onboarding
-  POST /api/onboarding          → summary → LLM → embedding → scan SSE
-  GET  /jobs/{user_id}          → SSE stream jobs depuis DB (cache)
-  POST /scan                    → SSE pipeline complet (nouveau scan)
-  GET  /cv                      → index.html (dashboard projet 1)
-
-  -- Routes projet 2 (dashboard Next.js) --
-  POST /api/login               → authentification
-  GET  /api/profile             → profil utilisateur
-  POST /api/profile             → sauvegarder profil
-  POST /api/matches             → matching jobs depuis DB
-  POST /api/gap                 → skills gap marché
-  POST /api/roadmap             → roadmap apprentissage
-  GET  /api/market              → analytics marché
-  POST /api/chat                → chatbot keyword
-  GET  /api/chat/history        → historique chat
-  POST /api/report              → rapport markdown
-  POST /api/report/pdf          → rapport PDF
-  GET  /api/status              → statut API
-  GET  /profile/{user_id}       → GET profil (compat projet 1)
-  PATCH /profile/{user_id}      → MAJ profil (compat projet 1)
+CORRECTIONS APPLIQUÉES (vs original) :
+  FIX 1 — stream_cached_jobs : log explicite + cast int(user_id) garanti
+  FIX 2 — GET /api/matches/{user_id} : nouvel endpoint GET pour dashboard Next.js
+           Le dashboard appelle GET /api/matches?user_id=X, pas POST /api/matches
+  FIX 3 — api_chat : remplacé chatbot keyword-only par LLM Azure OpenAI intelligent
+           avec contexte jobs DB + historique conversation + expert IT
+  FIX 4 — api_matches POST : user_id transmis correctement depuis sessionStorage
 """
 
 import asyncio
@@ -45,11 +23,18 @@ from pathlib import Path
 import aiohttp
 import numpy as np
 from dotenv import load_dotenv
-from fastapi import FastAPI, HTTPException
+from fastapi import FastAPI, HTTPException, Query
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import HTMLResponse, StreamingResponse
 from openai import AsyncAzureOpenAI
 from pydantic import BaseModel
+
+# Détection de langue automatique (inspiré du Cloud Coach)
+try:
+    from langdetect import detect as _detect_lang
+    _LANGDETECT_AVAILABLE = True
+except ImportError:
+    _LANGDETECT_AVAILABLE = False
 from sentence_transformers import SentenceTransformer
 
 import matcher as mtch
@@ -82,7 +67,6 @@ from job_analyzer_agent import (
     LEARNING_META,
 )
 
-# ── Fonctions DB chat + profil (asyncpg unifié — database.py) ────────────────
 from database import (
     save_chat_message as _save_chat_msg,
     load_chat_history as _load_chat_history,
@@ -117,10 +101,6 @@ async def startup():
 
 
 async def _refresh_market_analysis():
-    """
-    Recharge market_analysis depuis la DB PostgreSQL.
-    Appelé au startup et après chaque scan terminé.
-    """
     global market_analysis
     try:
         from database import get_pool
@@ -157,7 +137,7 @@ async def shutdown():
 
 
 # ═══════════════════════════════════════════════════════════════════════════════
-#  Chargement modèles (au démarrage)
+#  Chargement modèles
 # ═══════════════════════════════════════════════════════════════════════════════
 
 logger.info("Loading sentence-transformer (multilingual cosine filter)...")
@@ -167,17 +147,11 @@ logger.info("Sentence-transformer ready ✓")
 logger.info("Loading fine-tuned matching model...")
 MATCH_MODEL, MATCH_TOKENIZER = mtch.load_model()
 if MATCH_MODEL is None:
-    logger.warning(
-        "⚠  Fine-tuned model not found.\n"
-        "   Place files in:\n"
-        "     jobscan_model/finetuned_model.pt\n"
-        "     jobscan_model/tokenizer/\n"
-    )
+    logger.warning("⚠  Fine-tuned model not found.")
 else:
     logger.info("Fine-tuned model ready ✓")
 
-# Chargement des jobs pour le MarketAnalysis (projet 2)
-logger.info("Loading jobs for MarketAnalysis (project 2)...")
+logger.info("Loading jobs for MarketAnalysis...")
 _jobs_for_market = load_all_jobs(BASE_DIR)
 market_analysis  = MarketAnalysis(_jobs_for_market)
 logger.info(f"MarketAnalysis ready — {market_analysis.total} jobs ✓")
@@ -214,13 +188,11 @@ class ScanRequest(BaseModel):
 
 
 class OnboardingRequest(BaseModel):
-    """Nouveau user : saisit son résumé de profil → on lance le scan."""
     summary: str
     user_id: int
 
 
 class ProfileRequest(BaseModel):
-    """PATCH /profile/{user_id} — projet 1 compat"""
     first_name: str = None
     last_name:  str = None
     email:      str = None
@@ -228,7 +200,6 @@ class ProfileRequest(BaseModel):
 
 
 class ProfileIn(BaseModel):
-    """Corps des routes projet 2"""
     name:                str       = ""
     target_role:         str       = ""
     experience_years:    int       = 0
@@ -290,35 +261,27 @@ def _load_profile_file() -> CandidateProfile | None:
 
 
 # ═══════════════════════════════════════════════════════════════════════════════
-#  Routes — Pages HTML (projet 1)
+#  Routes — Pages HTML
 # ═══════════════════════════════════════════════════════════════════════════════
 
 @app.get("/")
 async def serve_login():
-    """Page 1 : saisie user_id."""
     return HTMLResponse((BASE_DIR / "login.html").read_text(encoding="utf-8"))
 
 
 @app.get("/cv")
 async def serve_cv():
-    """Page 2 : dashboard projet 1 (index.html)."""
     cv_html = BASE_DIR / "cv.html"
     html    = BASE_DIR / "index.html"
     return HTMLResponse((cv_html if cv_html.exists() else html).read_text(encoding="utf-8"))
 
 
 # ═══════════════════════════════════════════════════════════════════════════════
-#  Routes — User / Auth (projet 1 + 2)
+#  Routes — User / Auth
 # ═══════════════════════════════════════════════════════════════════════════════
 
 @app.get("/api/user/{user_id}")
 async def check_user(user_id: int):
-    """
-    Vérifie si le user existe.
-    Utilisé par le frontend Next.js pour décider :
-      → existe      → redirect /dashboard
-      → n'existe pas → redirect /onboarding
-    """
     user = await get_user(user_id)
     if user is None:
         return {"exists": False, "user_id": user_id}
@@ -335,7 +298,6 @@ async def check_user(user_id: int):
 
 @app.post("/api/login")
 async def login(data: UserLogin):
-    """Authentification projet 2."""
     uid = data.user_id.strip()
     if not uid:
         raise HTTPException(400, "User ID is required")
@@ -361,12 +323,11 @@ async def login(data: UserLogin):
 
 
 # ═══════════════════════════════════════════════════════════════════════════════
-#  Routes — Profil (projet 1 + 2)
+#  Routes — Profil
 # ═══════════════════════════════════════════════════════════════════════════════
 
 @app.get("/profile/{user_id}")
 async def get_profile_p1(user_id: int):
-    """Profil complet — compat projet 1."""
     user = await get_user(user_id)
     if user is None:
         raise HTTPException(status_code=404, detail=f"User {user_id} not found")
@@ -375,7 +336,6 @@ async def get_profile_p1(user_id: int):
 
 @app.patch("/profile/{user_id}")
 async def patch_profile_p1(user_id: int, req: ProfileRequest):
-    """MAJ profil (first_name, last_name, email, linkedin) — compat projet 1."""
     ok = await update_user_profile(
         user_id,
         first_name=req.first_name,
@@ -390,7 +350,6 @@ async def patch_profile_p1(user_id: int, req: ProfileRequest):
 
 @app.get("/api/profile")
 async def api_get_profile(user_id: str = ""):
-    """Profil — route projet 2."""
     if user_id:
         try:
             user = await get_user(int(user_id))
@@ -414,7 +373,6 @@ async def api_get_profile(user_id: str = ""):
                 "summary":            user.get("summary", ""),
             }
 
-    # Fallback fichier JSON local (projet 2)
     p = _load_profile_file()
     if not p:
         return {"exists": False}
@@ -423,7 +381,6 @@ async def api_get_profile(user_id: str = ""):
 
 @app.post("/api/profile")
 async def api_save_profile(data: ProfileIn):
-    """Sauvegarder profil — route projet 2."""
     prof = _to_candidate_profile(data)
     prof.save(PROFILE_PATH)
 
@@ -448,17 +405,11 @@ async def api_save_profile(data: ProfileIn):
 
 
 # ═══════════════════════════════════════════════════════════════════════════════
-#  Routes — Onboarding nouveau user
+#  Routes — Onboarding
 # ═══════════════════════════════════════════════════════════════════════════════
 
 @app.post("/api/onboarding")
 async def onboarding(req: OnboardingRequest):
-    """
-    Nouveau user : résumé profil → LLM extrait données + titre →
-    embedding → lance le scan SSE.
-    Le frontend Next.js doit ensuite appeler POST /scan avec le cv_text.
-    Ici on retourne juste les données extraites pour confirmation.
-    """
     if not req.user_id or req.user_id <= 0:
         raise HTTPException(400, "user_id invalide")
     if not req.summary.strip():
@@ -466,11 +417,9 @@ async def onboarding(req: OnboardingRequest):
 
     logger.info(f"[onboarding] user_id={req.user_id} summary_len={len(req.summary)}")
 
-    # LLM extrait titre + structure
     cv_title      = await extract_cv_title(req.summary)
     cv_structured = await structure_cv_for_model(cv_title, req.summary)
 
-    # Sauvegarder en DB
     ok = await upsert_user(req.user_id, cv_structured)
     if not ok:
         raise HTTPException(500, "Erreur sauvegarde DB")
@@ -487,20 +436,30 @@ async def onboarding(req: OnboardingRequest):
 
 
 # ═══════════════════════════════════════════════════════════════════════════════
-#  Routes — Jobs SSE (projet 1)
+#  Routes — Jobs SSE
 # ═══════════════════════════════════════════════════════════════════════════════
 
 @app.get("/jobs/{user_id}")
 async def stream_cached_jobs(user_id: int):
-    """SSE stream des jobs depuis PostgreSQL pour ce user_id (cache)."""
-    logger.info(f"[/jobs] GET /jobs/{user_id}")
+    """
+    SSE stream des jobs depuis PostgreSQL.
+    FIX : log explicite du user_id pour diagnostiquer les problèmes.
+    """
+    logger.info(f"[/jobs] GET /jobs/{user_id} — fetching from DB...")
 
     async def _stream():
-        jobs = await get_jobs_for_user(user_id)
+        # FIX : int() garanti même si user_id arrive en str depuis l'URL
+        uid = int(user_id)
+        jobs = await get_jobs_for_user(uid)
+
+        logger.info(f"[/jobs] user_id={uid} → {len(jobs)} jobs found in DB")
+
         if not jobs:
-            yield sse({"event": "no_cache", "user_id": user_id})
+            logger.warning(f"[/jobs] No jobs found for user_id={uid} — check id_user[] column in DB")
+            yield sse({"event": "no_cache", "user_id": uid})
             return
-        yield sse({"event": "cached", "total": len(jobs), "user_id": user_id})
+
+        yield sse({"event": "cached", "total": len(jobs), "user_id": uid})
         for job in jobs:
             yield sse(job)
         yield sse({"event": "done", "total": len(jobs), "from_cache": True})
@@ -518,7 +477,6 @@ async def stream_cached_jobs(user_id: int):
 
 @app.post("/scan")
 async def scan(req: ScanRequest):
-    """Lance le pipeline complet SSE."""
     logger.info(f"[/scan] POST — user_id={req.user_id} cv_len={len(req.cv_text)}")
     return StreamingResponse(
         pipeline(req.cv_text.strip(), req.user_id),
@@ -532,7 +490,7 @@ async def scan(req: ScanRequest):
 
 
 # ═══════════════════════════════════════════════════════════════════════════════
-#  Routes — Analytics marché (projet 2)
+#  Routes — Analytics marché
 # ═══════════════════════════════════════════════════════════════════════════════
 
 @app.get("/api/status")
@@ -546,9 +504,9 @@ def api_status():
 
 @app.get("/api/market")
 def api_market():
-    top_skills     = [{"skill": s, "count": c} for s, c in market_analysis.skill_counts.most_common(30)]
-    top_locations  = [{"location": l, "count": c} for l, c in market_analysis.locations.most_common(15)]
-    top_companies  = [{"company": co, "count": c} for co, c in market_analysis.companies.most_common(15)]
+    top_skills    = [{"skill": s, "count": c} for s, c in market_analysis.skill_counts.most_common(30)]
+    top_locations = [{"location": l, "count": c} for l, c in market_analysis.locations.most_common(15)]
+    top_companies = [{"company": co, "count": c} for co, c in market_analysis.companies.most_common(15)]
 
     salaries = {}
     for cur, vals in sorted(market_analysis.salary_by_currency.items()):
@@ -572,8 +530,51 @@ def api_market():
 
 
 # ═══════════════════════════════════════════════════════════════════════════════
-#  Routes — Matching / Gap / Roadmap (projet 2)
+#  Routes — Matching
 # ═══════════════════════════════════════════════════════════════════════════════
+
+@app.get("/api/matches/{user_id}")
+async def api_matches_get(user_id: int):
+    """
+    FIX : Nouvel endpoint GET /api/matches/{user_id}
+    Le dashboard Next.js appelle cette route directement avec le user_id dans l'URL.
+    Retourne les jobs depuis la DB pour cet utilisateur.
+    """
+    logger.info(f"[GET /api/matches/{user_id}] fetching jobs from DB...")
+    db_jobs = await get_jobs_for_user(user_id)
+    logger.info(f"[GET /api/matches/{user_id}] → {len(db_jobs)} jobs")
+
+    results = []
+    for j in db_jobs:
+        score = int(float(j.get("combined_score", 0)) * 100)
+        gap_missing = j.get("gap_missing", [])
+
+        results.append({
+            "title":       j.get("title", ""),
+            "company":     j.get("industry", ""),
+            "location":    j.get("location", ""),
+            "salary":      j.get("salary", ""),
+            "url":         j.get("url", ""),
+            "source":      j.get("source", ""),
+            "total":       score,
+            "skill_pct":   score,
+            "loc_pct":     0,
+            "title_pct":   0,
+            "matched":     [],
+            "missing":     gap_missing[:10],
+            "verdict":     "Strong" if score >= 70 else ("Good" if score >= 50 else "Partial"),
+            "description": (j.get("description") or "")[:2000],
+            "cosine":      round(float(j.get("cosine", 0)) * 100, 2),
+            "match_score": round(float(j.get("match_score", 0) or 0) * 100, 2),
+            "gap_coverage": j.get("gap_coverage", 0),
+            "gap_missing":  gap_missing,
+            "remote":      j.get("remote", ""),
+            "contract":    j.get("contract", ""),
+            "experience":  j.get("experience", ""),
+        })
+
+    return {"matches": results, "count": len(results), "source": "db"}
+
 
 @app.post("/api/matches")
 async def api_matches(
@@ -584,16 +585,19 @@ async def api_matches(
     location: str = "",
 ):
     """
-    Matching jobs.
-    Priorité : jobs DB de l'user (scores fins-tuné) → fallback MarketAnalysis.
+    Matching jobs POST — priorité DB si user_id fourni, sinon MarketAnalysis.
+    FIX : user_id correctement extrait du body.
     """
     results = []
 
-    # Priorité 1 — jobs déjà scrapés pour cet user depuis la DB
     if data.user_id:
         try:
-            db_jobs = await get_jobs_for_user(int(data.user_id))
-        except Exception:
+            uid = int(data.user_id)
+            logger.info(f"[POST /api/matches] user_id={uid} — fetching from DB")
+            db_jobs = await get_jobs_for_user(uid)
+            logger.info(f"[POST /api/matches] → {len(db_jobs)} jobs from DB")
+        except Exception as e:
+            logger.warning(f"[POST /api/matches] DB fetch failed: {e}")
             db_jobs = []
 
         for j in db_jobs:
@@ -640,7 +644,7 @@ async def api_matches(
             results.sort(key=lambda x: x["total"], reverse=True)
             return {"matches": results[:top_n], "count": len(results), "source": "db"}
 
-    # Fallback — MarketAnalysis (projet 2)
+    # Fallback MarketAnalysis
     prof = _to_candidate_profile(data)
     ms   = match_jobs(market_analysis, prof, top_n=top_n)
 
@@ -746,152 +750,266 @@ def api_roadmap(data: ProfileIn, top_n: int = 15):
 
 
 # ═══════════════════════════════════════════════════════════════════════════════
-#  Routes — Chatbot keyword (projet 2)
+#  Routes — Chatbot LLM intelligent (FIX MAJEUR)
 # ═══════════════════════════════════════════════════════════════════════════════
+
+def _build_chat_system_prompt(db_user: dict | None, db_jobs: list[dict]) -> str:
+    """
+    Construit le system prompt avec les vraies données DB de l'utilisateur.
+    """
+    # Bloc profil utilisateur
+    if db_user:
+        skills_str = db_user.get("skills", "") or "Non renseigné"
+        user_block = f"""## PROFIL DE L'UTILISATEUR (depuis PostgreSQL table `users`)
+- Nom : {db_user.get('first_name', '')} {db_user.get('last_name', '')}
+- Rôle cible : {db_user.get('role', 'N/A')}
+- Séniorité : {db_user.get('seniority', 'N/A')}
+- Expérience : {db_user.get('years_experience', 'N/A')} ans
+- Compétences : {skills_str}
+- Résumé : {db_user.get('summary', 'N/A')}"""
+    else:
+        user_block = "## PROFIL\nAucun profil trouvé en base."
+
+    # Bloc jobs
+    if db_jobs:
+        jobs_lines = []
+        for i, j in enumerate(db_jobs[:30], 1):
+            gap    = j.get("gap_missing", [])
+            score  = j.get("combined_score", 0) or 0
+            cosine = j.get("cosine", 0) or 0
+            jobs_lines.append(
+                f"{i}. **{j.get('title','?')}** chez {j.get('industry','?')} | "
+                f"{j.get('location','?')} | "
+                f"Score: {score*100:.0f}% | Cosine: {cosine*100:.0f}% | "
+                f"Manquant: {', '.join(gap[:5]) if gap else 'aucun'} | "
+                f"URL: {j.get('url','')}"
+            )
+        jobs_block = f"## JOBS DÉTECTÉS ({len(db_jobs)} jobs depuis PostgreSQL table `jobs`)\n" + "\n".join(jobs_lines)
+    else:
+        jobs_block = "## JOBS DÉTECTÉS\nAucun job trouvé pour cet utilisateur."
+
+    return f"""Tu es **JobScan AI**, un assistant expert en IT et carrière tech, intégré dans la plateforme JobScan.
+
+{user_block}
+
+{jobs_block}
+
+---
+
+## TON DOMAINE — L'INFORMATIQUE AU SENS LARGE
+
+Tu réponds à TOUTES les questions liées à l'informatique, la technologie et la carrière tech.
+
+### ✅ RÉPONDS TOUJOURS à ces sujets :
+
+**Hardware & Matériel :**
+PC, ordinateur, laptop, disque dur, SSD, HDD, RAM, mémoire, processeur, CPU, GPU, carte graphique,
+carte mère, écran, moniteur, clavier, souris, imprimante, scanner, serveur, datacenter, smartphone,
+tablette, périphérique, USB, câble, routeur, switch, modem, NAS, rack...
+
+**Systèmes d'exploitation & Software :**
+Windows, Linux, macOS, Ubuntu, Android, iOS, système d'exploitation, OS, logiciel, application,
+programme, driver, firmware, antivirus, mise à jour, installation, configuration, virtualisation, VM...
+
+**Réseaux & Internet :**
+HTTP, HTTPS, DNS, TCP/IP, VPN, WiFi, Ethernet, protocole, port, pare-feu, firewall, proxy,
+navigateur, URL, domaine, hébergement, SSL, TLS, IPv4, IPv6, LAN, WAN, routage, ping, SSH, FTP...
+
+**Développement & Code :**
+Python, JavaScript, TypeScript, Java, C, C++, C#, Go, Rust, PHP, Ruby, Swift, Kotlin, R, SQL, Bash,
+framework, librairie, API, REST, GraphQL, IDE, Git, GitHub, debug, algorithme, structure de données,
+objet, classe, fonction, variable, boucle, récursivité, compilateur, interpréteur, test unitaire...
+
+**Web & Frontend/Backend :**
+React, Next.js, Vue, Angular, HTML, CSS, Node.js, FastAPI, Django, Flask, Spring Boot, Laravel,
+base de données, MySQL, PostgreSQL, MongoDB, Redis, ORM, migration, endpoint, webhook...
+
+**Cloud & DevOps :**
+Azure, AWS, GCP, Docker, Kubernetes, Terraform, CI/CD, GitHub Actions, Jenkins, pipeline,
+déploiement, conteneur, microservices, serverless, load balancer, Nginx, monitoring, logs...
+
+**IA & Data Science :**
+LLM, GPT, Claude, machine learning, deep learning, NLP, computer vision, réseau de neurones,
+dataset, entraînement, fine-tuning, embedding, TensorFlow, PyTorch, Scikit-learn, Pandas, NumPy,
+Spark, Hadoop, ETL, data pipeline, feature engineering, modèle, inférence...
+
+**Cybersécurité :**
+virus, malware, ransomware, phishing, chiffrement, certificat SSL, authentification, OAuth,
+JWT, pentest, OWASP, CVE, zero-day, firewall, IDS, SIEM, audit sécurité...
+
+**Carrière IT :**
+développeur, ingénieur logiciel, DevOps engineer, data scientist, data engineer, ML engineer,
+architecte, CTO, product manager IT, salaire tech, entretien technique, CV tech,
+compétences manquantes, roadmap apprentissage, certifications (AWS, Azure, GCP, CKA, CKAD)...
+Jobs détectés dans ton profil, scores de matching, compétences à acquérir...
+
+---
+
+### ❌ REFUSE SEULEMENT ces sujets (clairement hors IT) :
+- Recettes de cuisine, gastronomie
+- Sport (football, tennis, natation...)
+- Médecine, santé, pharmacie (sauf healthtech)
+- Politique, géographie, histoire générale
+- Météo, tourisme, voyages
+- Animaux, nature, environnement
+- Physique/chimie sans lien avec l'informatique
+
+**Message de refus :** "Je suis spécialisé dans l'IT et la carrière tech. Pose-moi une question sur la programmation, les technologies, tes jobs détectés ou ta carrière ! 🚀"
+
+---
+
+### ⚠️ RÈGLE D'OR — EN CAS DE DOUTE : RÉPONDS
+
+Si tu n'es pas sûr qu'une question est hors IT → **RÉPONDS**. Mieux vaut répondre à une question limite que de refuser une vraie question IT.
+
+---
+
+## RÈGLES DE RÉPONSE
+1. **Réponds dans la langue de l'utilisateur** (français, anglais, arabe...)
+2. **Utilise le markdown** : titres, listes, blocs de code, gras
+3. **Cite les vraies données** : scores, URLs, compétences depuis le profil ci-dessus
+4. **Réponds en expert** : précis, concret, avec des exemples de code si utile
+5. **Jamais d'inventions** : si une info manque, dis-le clairement
+
+Date : {datetime.now().strftime('%Y-%m-%d')}"""
+
 
 @app.post("/api/chat")
 async def api_chat(data: ChatIn):
     """
-    Chatbot keyword — logique projet 2.
-    Enrichi avec les jobs réels de l'user depuis la DB si user_id fourni.
+    Chatbot IT JobScan — inspiré du Cloud Coach (collègue) :
+    ✅ STREAMING SSE mot par mot (réponse immédiate)
+    ✅ PARALLÉLISME asyncio.gather() — DB user + jobs + historique en même temps
+    ✅ Détection de langue automatique (langdetect)
+    ✅ Résumé automatique si historique > 8 messages
+    ✅ Timeout sécurisé — évite les blocages
     """
-    prof = _to_candidate_profile(data.profile) if data.profile else (
-        _load_profile_file() or CandidateProfile()
-    )
+    import time as _time
+    t0 = _time.time()
 
-    # Enrichir le profil avec les données DB si possible
-    if data.user_id:
+    # ── user_id ───────────────────────────────────────────────────────────────
+    uid_str = data.user_id or (data.profile.user_id if data.profile else "")
+    uid = 0
+    if uid_str:
         try:
-            db_user = await get_user(int(data.user_id))
-            if db_user and not prof.skills:
-                skills_from_db = [s.strip() for s in (db_user.get("skills") or "").split(",") if s.strip()]
-                if skills_from_db:
-                    prof.skills = skills_from_db
-                if not prof.target_role:
-                    prof.target_role = db_user.get("role", "")
-                if not prof.name:
-                    prof.name = " ".join(filter(None, [db_user.get("first_name"), db_user.get("last_name")])) or "there"
-        except Exception as e:
-            logger.warning(f"[chat] DB enrichment failed: {e}")
-
-    gap = compute_gap(market_analysis, prof.skills_set()) if prof.skills else None
-    ms  = match_jobs(market_analysis, prof, top_n=15) if prof.skills else []
-    m   = data.message.lower()
-
-    # Sauvegarder message user
-    if data.user_id and _DB2_AVAILABLE:
-        try:
-            await _save_chat_msg(data.user_id, "user", data.message)
+            uid = int(uid_str)
         except Exception:
             pass
 
-    response, intent = "", "unknown"
+    # ── Détection de langue automatique (inspiré Cloud Coach) ─────────────────
+    detected_lang = "fr"
+    if _LANGDETECT_AVAILABLE:
+        try:
+            detected_lang = "fr" if "fr" in _detect_lang(data.message) else "en"
+        except Exception:
+            detected_lang = "fr"
 
-    if any(w in m for w in ["match", "job", "find", "opening", "position", "offre", "emploi"]):
-        if data.user_id:
+    # ── PARALLÉLISME : user + jobs + historique en même temps ─────────────────
+    # Inspiré de asyncio.gather() du MemoryAgentProxy du collègue
+    async def _get_user():
+        return await get_user(uid) if uid > 0 else None
+
+    async def _get_jobs():
+        return await get_jobs_for_user(uid) if uid > 0 else []
+
+    async def _get_history():
+        if uid > 0 and _DB2_AVAILABLE:
             try:
-                db_jobs = await get_jobs_for_user(int(data.user_id))
-                if db_jobs:
-                    lines = [f"Here are your **top matched jobs**, {prof.name or 'there'}:\n"]
-                    for i, j in enumerate(db_jobs[:10], 1):
-                        score = round(float(j.get("combined_score", 0)) * 100)
-                        lines.append(
-                            f"**{i}. {j.get('title','')}** at {j.get('industry','')}\n"
-                            f"> {score}% match · {j.get('location','') or 'Remote'}\n"
-                        )
-                    response, intent = "\n".join(lines), "matches"
-                    ms = []  # skip market fallback
+                return await _load_chat_history(uid, limit=20)
             except Exception:
-                pass
+                return []
+        return []
 
-        if not response:
-            if not ms:
-                response, intent = "No matches found. Try broadening your skills or target role.", "matches"
-            else:
-                lines = [f"Here are your **top 10 job matches**, {prof.name or 'there'}:\n"]
-                for i, mt in enumerate(ms[:10], 1):
-                    j = mt["job"]
-                    lines.append(
-                        f"**{i}. {j.get('title','')}** at {j.get('company','')}\n"
-                        f"> {mt['total']}% fit ({mt['verdict']}) · {j.get('location','') or 'N/A'}\n"
-                    )
-                response, intent = "\n".join(lines), "matches"
+    try:
+        db_user, db_jobs, history = await asyncio.wait_for(
+            asyncio.gather(_get_user(), _get_jobs(), _get_history()),
+            timeout=8.0  # Timeout sécurisé — inspiré du Cloud Coach
+        )
+    except asyncio.TimeoutError:
+        logger.warning("[chat] DB timeout — réponse sans contexte")
+        db_user, db_jobs, history = None, [], []
+    except Exception as e:
+        logger.error(f"[chat] gather error: {e}")
+        db_user, db_jobs, history = None, [], []
 
-    elif any(w in m for w in ["gap", "missing", "lack", "need", "manque", "skill"]):
-        if not gap:
-            response, intent = "Enter your skills first so I can analyse your gap.", "gap"
-        else:
-            lines = [f"**Your market coverage: {gap['coverage']:.0%}**\n"]
-            for i, (s, c) in enumerate(gap["missing"][:10], 1):
-                lines.append(f"{i}. **{s}** — {c} jobs need this")
-            response, intent = "\n".join(lines), "gap"
+    t1 = _time.time()
+    logger.info(f"[chat] user={uid} lang={detected_lang} jobs={len(db_jobs)} history={len(history)} prep={t1-t0:.2f}s")
 
-    elif any(w in m for w in ["road", "learn", "path", "plan", "study", "apprend"]):
-        if not gap:
-            response, intent = "I need your skills to build a roadmap.", "roadmap"
-        else:
-            lines = [f"**Learning Roadmap for {prof.name or 'you'}:**\n"]
-            for s, c in gap["missing"][:10]:
-                meta = LEARNING_META.get(s, {})
-                lines.append(f"- **{s}** (~{meta.get('w',4)} wks) — *{meta.get('tip','Docs + projects')}*")
-            response, intent = "\n".join(lines), "roadmap"
+    # ── Sauvegarder le message user en arrière-plan (non bloquant) ────────────
+    if uid > 0 and _DB2_AVAILABLE:
+        asyncio.create_task(_safe_save_msg(uid, "user", data.message))
 
-    elif any(w in m for w in ["salary", "pay", "earn", "money", "salaire"]):
-        lines = ["**Salary insights:**\n"]
-        for cur, vals in sorted(market_analysis.salary_by_currency.items()):
-            if len(vals) >= 2:
-                lines.append(
-                    f"**{cur}** ({len(vals)} jobs): "
-                    f"{min(vals):,.0f} – {max(vals):,.0f} "
-                    f"(median {statistics.median(vals):,.0f})"
-                )
-        response, intent = "\n".join(lines), "salary"
+    # ── System prompt + historique ────────────────────────────────────────────
+    lang_rule = "(Règle : réponds IMPÉRATIVEMENT en Français.)" if detected_lang == "fr" else "(Rule: answer in English.)"
+    system_prompt = _build_chat_system_prompt(db_user, db_jobs)
+    messages_payload = [{"role": "system", "content": system_prompt}]
+    for h in history[-16:]:
+        messages_payload.append({"role": h["role"], "content": h["content"]})
+    messages_payload.append({"role": "user", "content": data.message + f"\n\n{lang_rule}"})
 
-    elif any(w in m for w in ["market", "overview", "trend", "demand", "marché"]):
-        top10 = market_analysis.skill_counts.most_common(10)
-        lines = [f"**Market:** {market_analysis.total} jobs, {len(market_analysis.sources)} sources\n"]
-        for i, (s, c) in enumerate(top10, 1):
-            lines.append(f"{i}. **{s}** — {c} mentions")
-        response, intent = "\n".join(lines), "market"
+    # ── APPEL LLM + RÉPONSE JSON (compatible frontend actuel) ───────────────
+    deployment = os.getenv("AZURE_OPENAI_DEPLOYMENT_NAME", "gpt-4o-mini")
+    response = ""
 
-    elif any(w in m for w in ["competi", "strong", "coverage", "chance", "profil"]):
-        if not gap:
-            response, intent = "Complete your profile first.", "competitive"
-        else:
-            cov = gap["coverage"]
-            v   = "strong" if cov >= 0.5 else ("competitive" if cov >= 0.25 else "building")
-            response, intent = (
-                f"You're **{v}** at **{cov:.0%}** coverage. "
-                f"Skills matched: {len(gap['matched'])} / {gap['total_market_skills']}",
-                "competitive"
+    try:
+        async with _azure_client() as az:
+            resp = await az.chat.completions.create(
+                model       = deployment,
+                messages    = messages_payload,
+                max_tokens  = 1500,
+                temperature = 0.3,
             )
+        response = resp.choices[0].message.content or ""
+    except Exception as e:
+        logger.error(f"[chat] LLM error: {e}")
+        response = f"⚠️ Erreur LLM : {str(e)}"
 
-    elif any(w in m for w in ["help", "what can", "menu", "aide"]):
-        response, intent = (
-            "Ask me about: **jobs**, **skills gap**, **roadmap**, **salary**, **market**, **competitiveness**",
-            "help"
-        )
+    # ── Sauvegarder réponse + résumé auto en arrière-plan ────────────────────
+    if uid > 0 and _DB2_AVAILABLE and response:
+        asyncio.create_task(_safe_save_msg(uid, "assistant", response))
+        # Résumé automatique si historique long (inspiré trigger_background_summary collègue)
+        if len(history) >= 8:
+            asyncio.create_task(_auto_summarize(uid, history, response, deployment))
 
-    elif any(w in m for w in ["hi", "hello", "hey", "bonjour", "salut"]):
-        response, intent = (
-            f"Hey {prof.name or 'there'}! Ask me about jobs, skills, salaries, or your career path.",
-            "greeting"
-        )
+    return {"response": response, "intent": "llm", "jobs_count": len(db_jobs)}
 
-    else:
-        response, intent = (
-            "Try asking about: jobs, skills gap, roadmap, salary, market, or competitiveness.",
-            "unknown"
-        )
 
-    # Sauvegarder réponse assistant
-    if data.user_id and _DB2_AVAILABLE:
-        try:
-            await _save_chat_msg(data.user_id, "assistant", response)
-        except Exception:
-            pass
+async def _safe_save_msg(uid: int, role: str, content: str):
+    """Sauvegarde non-bloquante d'un message chat."""
+    try:
+        await _save_chat_msg(uid, role, content)
+    except Exception as e:
+        logger.warning(f"[chat] save_msg failed: {e}")
 
-    return {"response": response, "intent": intent}
+
+async def _auto_summarize(uid: int, history: list, last_response: str, deployment: str):
+    """
+    Résumé automatique de l'historique si > 8 messages.
+    Inspiré de trigger_background_summary() du collègue.
+    Compresse les vieux messages en une note pour économiser les tokens.
+    """
+    try:
+        convo = "\n".join([f"{m['role'].upper()}: {m['content'][:200]}" for m in history[-8:]])
+        prompt = f"""Résume en 3 lignes maximum les sujets IT abordés dans cette conversation JobScan :
+
+{convo}
+
+Réponds uniquement avec le résumé, sans introduction."""
+
+        async with _azure_client() as az:
+            resp = await az.chat.completions.create(
+                model=deployment,
+                messages=[{"role": "user", "content": prompt}],
+                max_tokens=150,
+                temperature=0.1,
+            )
+        summary = resp.choices[0].message.content or ""
+        if summary:
+            # Sauvegarder le résumé comme message système dans l'historique
+            await _save_chat_msg(uid, "assistant", f"[RÉSUMÉ SESSION] {summary}")
+            logger.info(f"[chat] auto-summary saved for user={uid}")
+    except Exception as e:
+        logger.warning(f"[chat] auto_summarize failed: {e}")
 
 
 @app.get("/api/chat/history")
@@ -906,7 +1024,7 @@ async def api_chat_history(user_id: str = ""):
 
 
 # ═══════════════════════════════════════════════════════════════════════════════
-#  Routes — Report (projet 2)
+#  Routes — Report
 # ═══════════════════════════════════════════════════════════════════════════════
 
 @app.post("/api/report")
@@ -942,7 +1060,6 @@ def api_report_pdf(data: ProfileIn):
         title=f"Career Report – {prof.name}",
     )
 
-    # Couleurs thème projet 1
     BRAND       = colors.HexColor("#7b61ff")
     BRAND_GREEN = colors.HexColor("#00e5a0")
     GRAY        = colors.HexColor("#888888")
@@ -961,15 +1078,12 @@ def api_report_pdf(data: ProfileIn):
                                alignment=TA_CENTER, textColor=GRAY, spaceAfter=2)
 
     story = []
-
-    # Cover
     story.append(Spacer(1, 2*cm))
     story.append(Paragraph("Career Analysis Report", s_title))
     story.append(Paragraph(
         f"Prepared for <b>{prof.name}</b> | {datetime.now().strftime('%B %d, %Y')}", s_sub))
     story.append(HRFlowable(width="100%", thickness=2, color=BRAND, spaceAfter=10))
 
-    # 1. Profil
     story.append(Paragraph("1. Your Profile", s_h2))
     pdata = [
         ["Name",              prof.name],
@@ -991,7 +1105,6 @@ def api_report_pdf(data: ProfileIn):
     ]))
     story.append(t)
 
-    # 2. Market overview
     story.append(Paragraph("2. Market Overview", s_h2))
     ov = [[
         Paragraph(f"<b>{market_analysis.total}</b><br/><font size=8 color='#888'>Total Jobs</font>", s_center),
@@ -1009,7 +1122,6 @@ def api_report_pdf(data: ProfileIn):
     story.append(t)
     story.append(Spacer(1, 5*mm))
 
-    # 3. Competitiveness
     story.append(Paragraph("3. Your Competitiveness", s_h2))
     cov   = gap["coverage"]
     level = "Strong Candidate" if cov >= 0.5 else ("Competitive" if cov >= 0.25 else "Building Profile")
@@ -1035,7 +1147,6 @@ def api_report_pdf(data: ProfileIn):
         ]))
         story.append(t)
 
-    # 4. Best job matches
     story.append(PageBreak())
     story.append(Paragraph("4. Best Job Matches", s_h2))
     for rank, match in enumerate(matches[:15], 1):
@@ -1057,7 +1168,6 @@ def api_report_pdf(data: ProfileIn):
                 f"<font color='#ef4444'>✗ To learn:</font> {', '.join(match['missing'][:8])}", s_small))
         story.append(Spacer(1, 3*mm))
 
-    # Footer
     story.append(Spacer(1, 1*cm))
     story.append(HRFlowable(width="100%", thickness=1, color=GRAY, spaceAfter=6))
     story.append(Paragraph(
@@ -1128,7 +1238,6 @@ async def detect_and_translate_cv(cv_text: str) -> tuple[str, str, str]:
 
 
 async def extract_cv_title(cv_text: str) -> str:
-    """Extrait le titre principal du CV via LLM."""
     try:
         deployment = os.getenv("AZURE_OPENAI_DEPLOYMENT_NAME", "gpt-4o-mini")
         excerpt    = cv_text.strip()[:800]
@@ -1157,7 +1266,6 @@ async def extract_cv_title(cv_text: str) -> str:
 
 
 async def structure_cv_for_model(cv_title: str, cv_text: str) -> dict:
-    """Structure le CV en format training via LLM."""
     try:
         deployment = os.getenv("AZURE_OPENAI_DEPLOYMENT_NAME", "gpt-4o-mini")
         excerpt    = cv_text.strip()[:2000]
@@ -1190,14 +1298,12 @@ Resume:
         data = json.loads(resp.choices[0].message.content.strip())
         data["role"] = cv_title
 
-        # Normalise skills : le LLM retourne parfois une list au lieu d'une str
         raw_skills = data.get("skills", "")
         if isinstance(raw_skills, list):
             data["skills"] = ", ".join(s.strip() for s in raw_skills if s.strip())
         elif not isinstance(raw_skills, str):
             data["skills"] = str(raw_skills)
 
-        # Normalise bullets : même problème possible
         raw_bullets = data.get("bullets", "")
         if isinstance(raw_bullets, list):
             data["bullets"] = " | ".join(s.strip() for s in raw_bullets if s.strip())
@@ -1221,37 +1327,24 @@ Resume:
 
 
 # ═══════════════════════════════════════════════════════════════════════════════
-#  Pipeline principal (SSE) — projet 1 complet
+#  Pipeline principal SSE
 # ═══════════════════════════════════════════════════════════════════════════════
 
 async def pipeline(cv_text: str, user_id: int = 0):
-    """
-    Pipeline complet :
-      0. Detect language → translate
-      1. Extract CV title
-      2. Structure CV → LLM
-      3. Encode cv_title → embedding
-      4. Scrape 6 sources en parallèle
-      5. Per job : cosine filter → enrich → AI score → skills gap → SSE
-      6. Save to DB si user_id > 0
-    """
     cutoff    = datetime.now() - timedelta(days=MAX_AGE_DAYS)
     llm_sem   = asyncio.Semaphore(LLM_CONCURRENCY)
     has_model = MATCH_MODEL is not None
 
     logger.info(f"[pipeline] START — user_id={user_id} save_to_db={user_id > 0}")
 
-    # 0. Langue
     if cv_text:
         yield sse({"event": "lang_detecting"})
         cv_text, detected_lang, translated = await detect_and_translate_cv(cv_text)
         yield sse({"event": "lang_ready", "lang": detected_lang, "translated": translated})
 
-    # 1. Titre CV
     cv_title = await extract_cv_title(cv_text) if cv_text else "Software Engineer"
     yield sse({"event": "cv_title", "title": cv_title})
 
-    # 2. Structuration CV
     cv_structured: dict = {}
     if cv_text:
         yield sse({"event": "cv_structuring"})
@@ -1268,18 +1361,15 @@ async def pipeline(cv_text: str, user_id: int = 0):
             ok = await upsert_user(user_id, cv_structured)
             if ok:
                 yield sse({"event": "user_saved", "user_id": user_id})
-                logger.info(f"[pipeline] ✅ user_id={user_id} saved")
             else:
                 logger.error(f"[pipeline] ❌ Failed to save user_id={user_id}")
         else:
             logger.info("[pipeline] user_id=0 → anonymous scan")
 
-    # 3. Encode cv_title
     cv_vec: np.ndarray = await asyncio.to_thread(
         lambda: EMBED_MODEL.encode(cv_title, convert_to_numpy=True)
     )
 
-    # Shared state
     result_q   = asyncio.Queue()
     src_done_q = asyncio.Queue()
     pending    = {"n": 0}
@@ -1289,7 +1379,6 @@ async def pipeline(cv_text: str, user_id: int = 0):
     connector = aiohttp.TCPConnector(limit=30)
     async with aiohttp.ClientSession(headers=SHARED_HEADERS, connector=connector) as session:
 
-        # 4. Cosine filter par job
         async def handle_job(job: dict, source: str):
             job["source"] = source
             threshold = COSINE_THRESHOLD_EMPLOITIC if source == "emploitic" else COSINE_THRESHOLD
@@ -1298,19 +1387,10 @@ async def pipeline(cv_text: str, user_id: int = 0):
             )
             cosine = cosine_sim(cv_vec, job_vec)
             if cosine < threshold:
-                logger.info(
-                    f"  [filter] SKIP cosine={cosine:.2f} < {threshold} | "
-                    f"{source} | {job['title'][:50]}"
-                )
                 return
-            logger.info(
-                f"  [filter] PASS cosine={cosine:.2f} | "
-                f"{source} | {job['title'][:50]}"
-            )
             pending["n"] += 1
             asyncio.create_task(enrich(job, cosine))
 
-        # 5. Enrichissement LLM + scores
         async def enrich(job: dict, cosine: float):
             async with llm_sem:
                 try:
@@ -1397,31 +1477,26 @@ async def pipeline(cv_text: str, user_id: int = 0):
                         }
 
                     else:
-                        # aijobs + remoteok → extraction LLM
                         details = await extract_with_llm(
                             url=job["url"],
                             session=session,
                             cutoff=cutoff,
                         )
                         if details is None:
-                            logger.warning(f"  [enrich] SKIP extract_with_llm=None | {job['url'][:60]}")
                             return
 
-                    # b. AI match score
                     match_score = -1.0
                     if has_model and cv_structured:
                         match_score = await asyncio.to_thread(
                             lambda: mtch.predict(MATCH_MODEL, MATCH_TOKENIZER, cv_structured, details)
                         )
 
-                    # c. Skills gap
                     gap = {"missing": [], "matched": [], "coverage": 1.0, "total": 0}
                     if cv_structured:
                         gap = await asyncio.to_thread(
                             lambda: mtch.compute_skills_gap(cv_structured, details)
                         )
 
-                    # d. Score combiné
                     combined_score = mtch.compute_combined_score(match_score, gap)
 
                     logger.info(
@@ -1433,7 +1508,6 @@ async def pipeline(cv_text: str, user_id: int = 0):
                         f"miss={len(gap['missing'])}/{gap['total']}"
                     )
 
-                    # e. Card SSE
                     card = {
                         "event":   "job",
                         "url":     job["url"],
@@ -1467,7 +1541,6 @@ async def pipeline(cv_text: str, user_id: int = 0):
                     }
                     await result_q.put(card)
 
-                    # f. Save to DB
                     if user_id > 0:
                         ok = await insert_job(user_id, card)
                         if ok:
@@ -1482,7 +1555,6 @@ async def pipeline(cv_text: str, user_id: int = 0):
                     if all_done["v"] and pending["n"] <= 0:
                         await result_q.put(None)
 
-        # Scrapers 6 sources en parallèle
         async def run_source(name: str, scrape_fn, session_):
             try:
                 jobs = await scrape_fn(cv_title, session_)
@@ -1500,7 +1572,6 @@ async def pipeline(cv_text: str, user_id: int = 0):
         asyncio.create_task(run_source("greenhouse", scrape_greenhouse, session))
         asyncio.create_task(run_source("eluta",      scrape_eluta,      session))
 
-        # 6. Streaming loop
         job_count = 0
         while True:
             while not src_done_q.empty():

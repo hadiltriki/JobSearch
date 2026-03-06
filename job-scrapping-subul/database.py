@@ -1,53 +1,13 @@
 """
 database.py — PostgreSQL Azure connection + table creation + trigger
 
-SCHEMA :
-  TABLE users :
-    id            INTEGER PRIMARY KEY
-    first_name    TEXT                  ← nouveau
-    last_name     TEXT                  ← nouveau
-    email         TEXT                  ← nouveau
-    linkedin      TEXT                  ← nouveau
-    role          TEXT
-    seniority     TEXT
-    years_exp     TEXT
-    industry      TEXT
-    education     TEXT
-    skills        TEXT
-    summary       TEXT
-    bullets       TEXT
-    created_at    TIMESTAMP DEFAULT NOW()
-
-  TABLE jobs :
-    id_job           SERIAL PRIMARY KEY
-    id_user          INTEGER[]
-    url              TEXT UNIQUE (contrainte UNIQUE pour le trigger)
-    source           TEXT
-    title            TEXT
-    company          TEXT
-    location         TEXT
-    seniority        TEXT
-    industry         TEXT
-    must_have        TEXT
-    nice_to_have     TEXT
-    description      TEXT
-    responsibilities TEXT
-    requirements     TEXT
-    salary           TEXT
-    match_score      FLOAT
-    cosine_score     FLOAT
-    combined_score   FLOAT
-    contract         TEXT
-    education        TEXT
-    remote           TEXT
-    skills_gap       TEXT   ← JSON string des skills manquants
-    created_at       TIMESTAMP DEFAULT NOW()
-
-TRIGGER :
-  Avant INSERT dans jobs :
-    - Si url déjà présent ET id_user déjà dans id_user[] → SKIP
-    - Si url déjà présent ET id_user pas dans id_user[] → UPDATE (append id_user)
-    - Si url absent → INSERT normal
+CORRECTIONS APPLIQUÉES (vs version originale) :
+  FIX 1 — get_jobs_for_user : WHERE $1::integer = ANY(id_user)
+           cast explicite évite le type mismatch asyncpg integer[] vs int4
+  FIX 2 — get_jobs_for_user : gap_coverage calculé correctement
+           était "1.0 if not gap else 0.0" → toujours 0% si gap non vide!
+           maintenant : (total_req - missing) / total_req
+  FIX 3 — user_has_jobs : même cast ::integer
 """
 
 import json as _json
@@ -68,17 +28,6 @@ logger = logging.getLogger(__name__)
 # ─────────────────────────────────────────────────────────────────────────────
 
 def _get_dsn() -> str:
-    """
-    Lit la connection string PostgreSQL Azure depuis .env.
-    Format attendu dans .env :
-      POSTGRES_DSN=postgresql://user:password@host.postgres.database.azure.com:5432/dbname?sslmode=require
-    OU les variables séparées :
-      POSTGRES_HOST=...
-      POSTGRES_USER=...
-      POSTGRES_PASSWORD=...
-      POSTGRES_DB=...
-      POSTGRES_PORT=5432
-    """
     dsn = os.getenv("POSTGRES_DSN", "").strip()
     if dsn:
         logger.info("[db] Using POSTGRES_DSN from .env")
@@ -153,23 +102,19 @@ CREATE TABLE IF NOT EXISTS users (
     created_at    TIMESTAMP DEFAULT NOW()
 );
 
--- ── Migration : ajouter les colonnes si elles n'existent pas encore ──────────
--- Idempotent : ALTER TABLE … ADD COLUMN IF NOT EXISTS (PostgreSQL 9.6+)
 ALTER TABLE users ADD COLUMN IF NOT EXISTS first_name TEXT;
 ALTER TABLE users ADD COLUMN IF NOT EXISTS last_name  TEXT;
 ALTER TABLE users ADD COLUMN IF NOT EXISTS email      TEXT;
 ALTER TABLE users ADD COLUMN IF NOT EXISTS linkedin   TEXT;
 
 -- ── Table jobs ───────────────────────────────────────────────────────────────
--- IMPORTANT : url a une contrainte UNIQUE pour que le trigger fonctionne
--- correctement et pour que SELECT … WHERE url = $1 soit performant.
 CREATE TABLE IF NOT EXISTS jobs (
     id_job           SERIAL PRIMARY KEY,
     id_user          INTEGER[],
     url              TEXT NOT NULL UNIQUE,
     source           TEXT,
     title            TEXT,
-    industry         TEXT,            -- nom de la société (ex: "Anthropic", "Nearform")
+    industry         TEXT,
     location         TEXT,
     seniority        TEXT,
     must_have        TEXT,
@@ -188,17 +133,14 @@ CREATE TABLE IF NOT EXISTS jobs (
     created_at       TIMESTAMP DEFAULT NOW()
 );
 
--- Index sur url pour le trigger (performance)
-CREATE INDEX IF NOT EXISTS idx_jobs_url ON jobs(url);
--- Index GIN sur id_user pour les recherches par user
+CREATE INDEX IF NOT EXISTS idx_jobs_url     ON jobs(url);
 CREATE INDEX IF NOT EXISTS idx_jobs_id_user ON jobs USING GIN(id_user);
 
 -- ── Table chat_history ────────────────────────────────────────────────────────
--- Stocke l'historique des conversations Career Assistant
 CREATE TABLE IF NOT EXISTS chat_history (
     id         SERIAL PRIMARY KEY,
     user_id    INTEGER NOT NULL,
-    role       TEXT NOT NULL,    -- "user" | "assistant"
+    role       TEXT NOT NULL,
     content    TEXT NOT NULL,
     created_at TIMESTAMP DEFAULT NOW()
 );
@@ -211,7 +153,6 @@ DECLARE
     existing_id    INTEGER;
     existing_users INTEGER[];
 BEGIN
-    -- Cherche si cette URL existe déjà
     SELECT id_job, id_user
     INTO existing_id, existing_users
     FROM jobs
@@ -219,13 +160,10 @@ BEGIN
     LIMIT 1;
 
     IF FOUND THEN
-        -- URL déjà présente
         IF NEW.id_user[1] = ANY(existing_users) THEN
-            -- Ce user a déjà ce job → SKIP (annuler l'INSERT)
             RAISE NOTICE 'SKIP: url=% already exists for user=%', NEW.url, NEW.id_user[1];
             RETURN NULL;
         ELSE
-            -- Nouveau user pour ce job → append id_user et UPDATE scores
             UPDATE jobs
             SET
                 id_user        = array_append(existing_users, NEW.id_user[1]),
@@ -234,16 +172,14 @@ BEGIN
                 combined_score = GREATEST(combined_score, COALESCE(NEW.combined_score, combined_score))
             WHERE id_job = existing_id;
             RAISE NOTICE 'APPEND: user=% added to job url=%', NEW.id_user[1], NEW.url;
-            RETURN NULL;  -- annuler l'INSERT original (on a fait UPDATE)
+            RETURN NULL;
         END IF;
     END IF;
 
-    -- URL absente → INSERT normal
     RETURN NEW;
 END;
 $$ LANGUAGE plpgsql;
 
--- ── Trigger BEFORE INSERT ────────────────────────────────────────────────────
 DROP TRIGGER IF EXISTS trg_jobs_upsert ON jobs;
 CREATE TRIGGER trg_jobs_upsert
     BEFORE INSERT ON jobs
@@ -269,15 +205,6 @@ async def init_db():
 # ─────────────────────────────────────────────────────────────────────────────
 
 async def upsert_user(user_id: int, cv_structured: dict) -> bool:
-    """
-    Insère ou met à jour l'utilisateur avec les données structurées du CV.
-    Retourne True si succès.
-
-    Champs acceptés dans cv_structured :
-      first_name, last_name, email, linkedin  (optionnels — profil utilisateur)
-      role, seniority, years_experience, industry, education,
-      skills, summary, bullets               (extraits du CV)
-    """
     logger.info(f"[db] upsert_user called — user_id={user_id}")
 
     if not user_id or user_id <= 0:
@@ -306,26 +233,23 @@ async def upsert_user(user_id: int, cv_structured: dict) -> bool:
             summary    = EXCLUDED.summary,
             bullets    = EXCLUDED.bullets
     """
-    # COALESCE pour first_name/last_name/email/linkedin :
-    # si la valeur entrante est NULL (non fournie), on conserve l'ancienne.
-    # Ainsi un scan CV ne réinitialise pas le profil saisi manuellement.
     try:
         async with pool.acquire() as conn:
             await conn.execute(
                 sql,
-                user_id,                                          # $1  id
-                cv_structured.get("first_name") or None,          # $2  first_name
-                cv_structured.get("last_name")  or None,          # $3  last_name
-                cv_structured.get("email")      or None,          # $4  email
-                cv_structured.get("linkedin")   or None,          # $5  linkedin
-                cv_structured.get("role", ""),                    # $6  role
-                cv_structured.get("seniority", ""),               # $7  seniority
-                cv_structured.get("years_experience", ""),        # $8  years_exp
-                cv_structured.get("industry", ""),                # $9  industry
-                cv_structured.get("education", ""),               # $10 education
-                cv_structured.get("skills", ""),                  # $11 skills
-                cv_structured.get("summary", ""),                 # $12 summary
-                cv_structured.get("bullets", ""),                 # $13 bullets
+                user_id,
+                cv_structured.get("first_name") or None,
+                cv_structured.get("last_name")  or None,
+                cv_structured.get("email")      or None,
+                cv_structured.get("linkedin")   or None,
+                cv_structured.get("role", ""),
+                cv_structured.get("seniority", ""),
+                cv_structured.get("years_experience", ""),
+                cv_structured.get("industry", ""),
+                cv_structured.get("education", ""),
+                cv_structured.get("skills", ""),
+                cv_structured.get("summary", ""),
+                cv_structured.get("bullets", ""),
             )
         logger.info(f"[db] ✅ User {user_id} upserted OK")
         return True
@@ -335,9 +259,6 @@ async def upsert_user(user_id: int, cv_structured: dict) -> bool:
 
 
 async def get_user(user_id: int) -> Optional[dict]:
-    """
-    Retourne le CV structuré de l'utilisateur ou None s'il n'existe pas.
-    """
     pool = await get_pool()
     try:
         async with pool.acquire() as conn:
@@ -348,12 +269,10 @@ async def get_user(user_id: int) -> Optional[dict]:
             logger.info(f"[db] get_user: no user found for id={user_id}")
             return None
         return {
-            # ── Profil utilisateur ────────────────────────────────────────
             "first_name":       row["first_name"],
             "last_name":        row["last_name"],
             "email":            row["email"],
             "linkedin":         row["linkedin"],
-            # ── Données CV ────────────────────────────────────────────────
             "role":             row["role"],
             "seniority":        row["seniority"],
             "years_experience": row["years_exp"],
@@ -375,15 +294,6 @@ async def update_user_profile(
     email:      str = None,
     linkedin:   str = None,
 ) -> bool:
-    """
-    Met à jour uniquement les champs de profil (first_name, last_name, email, linkedin).
-    N'écrase pas les données CV (role, skills, etc.).
-    Utilisé depuis l'API /profile ou la page de paramètres.
-
-    Exemple d'appel depuis main.py :
-        await update_user_profile(1001, first_name="Alice", last_name="Dupont",
-                                  email="alice@example.com", linkedin="linkedin.com/in/alice")
-    """
     logger.info(f"[db] update_user_profile — user_id={user_id}")
 
     if not user_id or user_id <= 0:
@@ -410,7 +320,6 @@ async def update_user_profile(
                 email      or None,
                 linkedin   or None,
             )
-        # asyncpg retourne "UPDATE N" — vérifier qu'au moins 1 ligne a été modifiée
         updated = int(result.split()[-1]) if result else 0
         if updated == 0:
             logger.warning(f"[db] update_user_profile: user_id={user_id} not found in DB")
@@ -420,27 +329,13 @@ async def update_user_profile(
     except Exception as e:
         logger.error(f"[db] ❌ update_user_profile failed for user_id={user_id}: {e}")
         return False
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+#  CRUD jobs
 # ─────────────────────────────────────────────────────────────────────────────
 
 async def insert_job(user_id: int, card: dict) -> bool:
-    """
-    Insère un job pour un utilisateur.
-    Le trigger gère automatiquement :
-      - SKIP si url + user_id déjà présents
-      - APPEND si url présente mais user_id nouveau
-      - INSERT si url absente
-
-    FIX 1 : Vérification user_id valide avant d'appeler
-    FIX 2 : Mapping correct des clés du card SSE vers les colonnes DB
-             card SSE      → colonne DB
-             "cosine"      → cosine_score   (et non "cosine_score")
-             "experience"  → seniority      (niveau d'expérience requis)
-             "tags"        → industry
-             "skills_req"  → must_have + requirements
-             "skills_bon"  → nice_to_have
-             "gap_missing" → skills_gap (JSON)
-    FIX 3 : match_score peut être -1.0 si pas de modèle → stocker NULL plutôt
-    """
     logger.info(f"[db] insert_job called — user_id={user_id} url={card.get('url','')[:60]}")
 
     if not user_id or user_id <= 0:
@@ -451,17 +346,14 @@ async def insert_job(user_id: int, card: dict) -> bool:
         logger.warning("[db] insert_job skipped: url vide")
         return False
 
-    # Skills gap → JSON string
     gap_missing = card.get("gap_missing", [])
     skills_gap  = _json.dumps(gap_missing, ensure_ascii=False)
 
-    # match_score = -1 si pas de modèle fine-tuné → stocker NULL en DB
     raw_match = card.get("match_score", -1)
     match_score_db: Optional[float] = None
     if raw_match is not None and raw_match >= 0:
         match_score_db = float(raw_match)
 
-    # cosine → le card SSE utilise la clé "cosine" (et non "cosine_score")
     raw_cosine = card.get("cosine", card.get("cosine_score", 0))
     cosine_score_db = float(raw_cosine or 0)
 
@@ -488,26 +380,26 @@ async def insert_job(user_id: int, card: dict) -> bool:
         async with pool.acquire() as conn:
             await conn.execute(
                 sql,
-                [user_id],                                       # $1  id_user
-                card.get("url", ""),                             # $2  url
-                card.get("source", ""),                          # $3  source
-                card.get("title", ""),                           # $4  title
-                card.get("industry") or card.get("company", ""),# $5  industry = nom société
-                card.get("location", ""),                        # $6  location
-                card.get("experience", ""),                      # $7  seniority
-                card.get("skills_req", ""),                      # $8  must_have
-                card.get("skills_bon", ""),                      # $9  nice_to_have
-                card.get("description", ""),                     # $10 description
-                card.get("description", ""),                     # $11 responsibilities
-                card.get("skills_req", ""),                      # $12 requirements
-                card.get("salary", ""),                          # $13 salary
-                match_score_db,                                  # $14 match_score
-                cosine_score_db,                                 # $15 cosine_score
-                combined_score_db,                               # $16 combined_score
-                card.get("contract", ""),                        # $17 contract
-                card.get("education", ""),                       # $18 education
-                card.get("remote", ""),                          # $19 remote
-                skills_gap,                                      # $20 skills_gap (JSON)
+                [user_id],
+                card.get("url", ""),
+                card.get("source", ""),
+                card.get("title", ""),
+                card.get("industry") or card.get("company", ""),
+                card.get("location", ""),
+                card.get("experience", ""),
+                card.get("skills_req", ""),
+                card.get("skills_bon", ""),
+                card.get("description", ""),
+                card.get("description", ""),
+                card.get("skills_req", ""),
+                card.get("salary", ""),
+                match_score_db,
+                cosine_score_db,
+                combined_score_db,
+                card.get("contract", ""),
+                card.get("education", ""),
+                card.get("remote", ""),
+                skills_gap,
             )
         logger.info(f"[db] ✅ Job inserted/updated — user={user_id} url={card.get('url','')[:60]}")
         return True
@@ -520,6 +412,10 @@ async def get_jobs_for_user(user_id: int) -> list[dict]:
     """
     Retourne tous les jobs où user_id est dans id_user[].
     Triés par combined_score DESC.
+
+    FIX 1 : $1::integer — cast explicite pour éviter type mismatch asyncpg
+             avec les colonnes INTEGER[] sur Azure PostgreSQL.
+    FIX 2 : gap_coverage calculé correctement depuis must_have vs gap_missing.
     """
     pool = await get_pool()
     try:
@@ -527,7 +423,7 @@ async def get_jobs_for_user(user_id: int) -> list[dict]:
             rows = await conn.fetch(
                 """
                 SELECT * FROM jobs
-                WHERE $1 = ANY(id_user)
+                WHERE $1::integer = ANY(id_user)
                 ORDER BY combined_score DESC NULLS LAST
                 """,
                 user_id,
@@ -544,38 +440,43 @@ async def get_jobs_for_user(user_id: int) -> list[dict]:
             cosine_raw   = row["cosine_score"]  or 0.0
             combined_raw = row["combined_score"] or 0.0
 
+            # ── FIX 2 : gap_coverage correct ──────────────────────────────
+            must_have_str  = row["must_have"] or ""
+            must_have_list = [s.strip() for s in must_have_str.split(",") if s.strip()]
+            total_skills   = len(must_have_list)
+            missing_count  = len(gap)
+            if total_skills > 0:
+                gap_coverage = max(0.0, (total_skills - missing_count) / total_skills)
+            else:
+                # Pas de skills requis connus → couverture complète si pas de gap
+                gap_coverage = 1.0 if missing_count == 0 else 0.5
+
             result.append({
-                # ── Identifiants ──────────────────────────────────────────
                 "id_job":         row["id_job"],
                 "url":            row["url"],
                 "source":         row["source"],
-                # ── Infos job ─────────────────────────────────────────────
                 "title":          row["title"],
-                "industry":       row["industry"] or "",   # nom société → affiché "at Nearform"
+                "industry":       row["industry"] or "",
                 "location":       row["location"],
                 "remote":         row["remote"],
                 "salary":         row["salary"],
                 "contract":       row["contract"],
                 "education":      row["education"],
                 "experience":     row["seniority"],
-                # ── Scores ────────────────────────────────────────────────
                 "match_score":         match_raw if match_raw is not None else -1,
                 "cosine":              cosine_raw,
                 "combined_score":      combined_raw,
                 "match_score_display":    f"{(match_raw or 0) * 100:.2f}" if match_raw is not None and match_raw >= 0 else "—",
                 "cosine_display":         f"{cosine_raw   * 100:.2f}",
                 "combined_score_display": f"{combined_raw * 100:.2f}",
-                # ── Skills gap ────────────────────────────────────────────
                 "gap_missing":    gap,
                 "gap_matched":    [],
-                "gap_coverage":   1.0 if not gap else 0.0,
-                "gap_total":      len(gap),
-                # ── Détails ───────────────────────────────────────────────
+                "gap_coverage":   gap_coverage,   # ← FIX 2
+                "gap_total":      total_skills,
                 "description":    row["description"],
                 "skills_req":     row["must_have"],
                 "skills_bon":     row["nice_to_have"],
-                "tags":           row["requirements"],      # tags frontend = colonne requirements DB
-                # ── Compatibilité SSE frontend ────────────────────────────
+                "tags":           row["requirements"],
                 "event":          "job",
             })
         logger.info(f"[db] get_jobs_for_user: {len(result)} jobs for user_id={user_id}")
@@ -586,12 +487,16 @@ async def get_jobs_for_user(user_id: int) -> list[dict]:
 
 
 async def user_has_jobs(user_id: int) -> bool:
-    """Vérifie si l'utilisateur a déjà des jobs en base."""
+    """
+    Vérifie si l'utilisateur a déjà des jobs en base.
+    FIX : cast ::integer comme get_jobs_for_user.
+    """
     pool = await get_pool()
     try:
         async with pool.acquire() as conn:
             count = await conn.fetchval(
-                "SELECT COUNT(*) FROM jobs WHERE $1 = ANY(id_user)", user_id
+                "SELECT COUNT(*) FROM jobs WHERE $1::integer = ANY(id_user)",
+                user_id,
             )
         has = (count or 0) > 0
         logger.info(f"[db] user_has_jobs: user_id={user_id} → {count} jobs")
@@ -602,14 +507,10 @@ async def user_has_jobs(user_id: int) -> bool:
 
 
 # ─────────────────────────────────────────────────────────────────────────────
-#  Chat History (Career Assistant)
+#  Chat History
 # ─────────────────────────────────────────────────────────────────────────────
 
 async def save_chat_message(user_id: int, role: str, content: str) -> bool:
-    """
-    Sauvegarde un message dans l'historique de chat.
-    role = "user" | "assistant"
-    """
     pool = await get_pool()
     try:
         async with pool.acquire() as conn:
@@ -625,9 +526,6 @@ async def save_chat_message(user_id: int, role: str, content: str) -> bool:
 
 
 async def load_chat_history(user_id: int, limit: int = 50) -> list[dict]:
-    """
-    Retourne l'historique de chat d'un utilisateur (ordre chronologique).
-    """
     pool = await get_pool()
     try:
         async with pool.acquire() as conn:
@@ -647,4 +545,3 @@ async def load_chat_history(user_id: int, limit: int = 50) -> list[dict]:
     except Exception as e:
         logger.error(f"[db] load_chat_history failed for user_id={user_id}: {e}")
         return []
-    
