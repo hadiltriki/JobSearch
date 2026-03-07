@@ -159,7 +159,154 @@ LEARNING_META: Dict[str, Dict[str, Any]] = {
     "Rust":               {"d": "Advanced",     "w": 12, "pre": [],                      "tip": "The Rust Book + Rustlings exercises"},
     "Snowflake":          {"d": "Intermediate", "w": 4,  "pre": ["SQL"],                 "tip": "Snowflake University free courses"},
     "Kotlin":             {"d": "Intermediate", "w": 6,  "pre": ["Java"],                "tip": "Kotlin Koans + official docs"},
+    # ── Web Frameworks ────────────────────────────────────────────────────────
+    "Vue.js":             {"d": "Intermediate", "w": 5,  "pre": ["JavaScript"],          "tip": "Vue.js official guide + build a SPA"},
+    "Next.js":            {"d": "Intermediate", "w": 4,  "pre": ["React"],               "tip": "Next.js official docs + Vercel tutorials"},
+    "Nuxt":               {"d": "Intermediate", "w": 4,  "pre": ["Vue.js"],              "tip": "Nuxt.js official docs + build an SSR app"},
+    "Spring Boot":        {"d": "Intermediate", "w": 8,  "pre": ["Java"],                "tip": "Spring.io guides + Baeldung tutorials"},
+    "Express.js":         {"d": "Beginner",     "w": 3,  "pre": ["Node.js"],             "tip": "Express.js official docs + REST API project"},
+    "ASP.NET":            {"d": "Intermediate", "w": 8,  "pre": ["C#"],                  "tip": "Microsoft Learn ASP.NET path"},
+    ".NET Core":          {"d": "Intermediate", "w": 8,  "pre": ["C#"],                  "tip": "Microsoft Learn .NET fundamentals"},
+    "Rails":              {"d": "Intermediate", "w": 8,  "pre": ["Ruby"],                "tip": "Rails Guides + Michael Hartl's Rails Tutorial"},
+    "Laravel":            {"d": "Intermediate", "w": 6,  "pre": ["PHP"],                 "tip": "Laravel official docs + Laracasts"},
+    "Svelte":             {"d": "Intermediate", "w": 4,  "pre": ["JavaScript"],          "tip": "Svelte official tutorial (svelte.dev/tutorial)"},
+    "Streamlit":          {"d": "Beginner",     "w": 2,  "pre": ["Python"],              "tip": "Streamlit docs + build a data dashboard"},
+    "Tailwind CSS":       {"d": "Beginner",     "w": 2,  "pre": ["HTML", "CSS"],         "tip": "Tailwind CSS docs + Tailwind UI components"},
+    "Bootstrap":          {"d": "Beginner",     "w": 2,  "pre": ["HTML", "CSS"],         "tip": "Bootstrap official docs + build a responsive page"},
+    # ── Databases ─────────────────────────────────────────────────────────────
+    "MySQL":              {"d": "Beginner",     "w": 3,  "pre": ["SQL"],                 "tip": "MySQL Tutorial + W3Schools SQL exercises"},
+    "DynamoDB":           {"d": "Intermediate", "w": 4,  "pre": ["AWS"],                 "tip": "AWS DynamoDB docs + PartiQL tutorial"},
+    "Cassandra":          {"d": "Advanced",     "w": 6,  "pre": [],                      "tip": "DataStax Academy free courses"},
+    "BigQuery":           {"d": "Intermediate", "w": 4,  "pre": ["SQL", "GCP"],          "tip": "Google BigQuery codelabs + Coursera"},
+    "Redshift":           {"d": "Intermediate", "w": 4,  "pre": ["SQL", "AWS"],          "tip": "AWS Redshift getting started guide"},
+    "Oracle":             {"d": "Intermediate", "w": 6,  "pre": ["SQL"],                 "tip": "Oracle LiveSQL + Oracle University free tutorials"},
+    "SQL Server":         {"d": "Intermediate", "w": 4,  "pre": ["SQL"],                 "tip": "Microsoft Learn SQL Server path"},
+    "Neo4j":              {"d": "Intermediate", "w": 4,  "pre": [],                      "tip": "Neo4j Graph Academy (free courses)"},
+    "SQLite":             {"d": "Beginner",     "w": 1,  "pre": ["SQL"],                 "tip": "SQLite official docs + Python sqlite3 module"},
+    # ── Cloud & DevOps ────────────────────────────────────────────────────────
+    "Google Cloud":       {"d": "Intermediate", "w": 10, "pre": [],                      "tip": "Google Cloud Skills Boost (free labs)"},
+    "Ansible":            {"d": "Intermediate", "w": 4,  "pre": ["Linux"],               "tip": "Ansible official docs + Red Hat free course"},
+    "Jenkins":            {"d": "Intermediate", "w": 3,  "pre": ["Git"],                 "tip": "Jenkins official docs + build a CI pipeline"},
+    "GitHub Actions":     {"d": "Intermediate", "w": 2,  "pre": ["Git"],                 "tip": "GitHub Actions docs + build a CI/CD workflow"},
+    "GitLab CI":          {"d": "Intermediate", "w": 2,  "pre": ["Git"],                 "tip": "GitLab CI/CD docs + .gitlab-ci.yml tutorial"},
+    "Nginx":              {"d": "Intermediate", "w": 3,  "pre": ["Linux"],               "tip": "Nginx official docs + DigitalOcean tutorials"},
+    "OpenShift":          {"d": "Advanced",     "w": 8,  "pre": ["Kubernetes"],          "tip": "Red Hat OpenShift Interactive Learning Portal"},
+    "Lambda":             {"d": "Intermediate", "w": 3,  "pre": ["AWS"],                 "tip": "AWS Lambda getting started + serverless.com"},
+    "Cloudflare":         {"d": "Beginner",     "w": 2,  "pre": [],                      "tip": "Cloudflare Learning Center + Workers docs"},
+    "Vercel":             {"d": "Beginner",     "w": 1,  "pre": ["Next.js"],             "tip": "Vercel official docs + deploy a Next.js project"},
+    "Heroku":             {"d": "Beginner",     "w": 1,  "pre": [],                      "tip": "Heroku Dev Center getting started guides"},
+    # ── Data & ML ─────────────────────────────────────────────────────────────
+    "Natural Language Processing": {"d": "Advanced", "w": 12, "pre": ["Python", "Machine Learning"], "tip": "Hugging Face NLP course + spaCy tutorials"},
+    "Computer Vision":    {"d": "Advanced",     "w": 12, "pre": ["Python", "Deep Learning"], "tip": "fast.ai CV course + OpenCV tutorials"},
+    "Keras":              {"d": "Intermediate", "w": 5,  "pre": ["Python"],              "tip": "Keras official docs + François Chollet's book"},
+    "XGBoost":            {"d": "Intermediate", "w": 3,  "pre": ["Python", "Scikit-learn"], "tip": "XGBoost docs + Kaggle competitions"},
+    "LightGBM":           {"d": "Intermediate", "w": 3,  "pre": ["Python", "Scikit-learn"], "tip": "LightGBM docs + Microsoft tutorials"},
+    "NumPy":              {"d": "Beginner",     "w": 2,  "pre": ["Python"],              "tip": "NumPy quickstart tutorial + CS231n numpy guide"},
+    "SciPy":              {"d": "Intermediate", "w": 3,  "pre": ["NumPy"],               "tip": "SciPy official docs + scientific Python lectures"},
+    "PySpark":            {"d": "Advanced",     "w": 6,  "pre": ["Python", "Spark"],     "tip": "Databricks PySpark tutorial + Coursera"},
+    "Hadoop":             {"d": "Advanced",     "w": 8,  "pre": ["Java", "Linux"],       "tip": "Hadoop official docs + Cloudera tutorials"},
+    "dbt":                {"d": "Intermediate", "w": 3,  "pre": ["SQL"],                 "tip": "dbt Learn (getdbt.com) + Coalesce conference talks"},
+    "ETL":                {"d": "Intermediate", "w": 4,  "pre": ["SQL", "Python"],       "tip": "Build an ETL pipeline with Airflow + dbt"},
+    "Data Pipeline":      {"d": "Intermediate", "w": 4,  "pre": ["Python", "SQL"],       "tip": "Build end-to-end pipeline: ingest → transform → load"},
+    "LLM":                {"d": "Advanced",     "w": 8,  "pre": ["Python", "NLP"],       "tip": "Hugging Face LLM course + LangChain docs"},
+    "Transformer":        {"d": "Advanced",     "w": 10, "pre": ["Deep Learning"],       "tip": "Attention Is All You Need paper + Hugging Face course"},
+    "MLflow":             {"d": "Intermediate", "w": 3,  "pre": ["Python", "Machine Learning"], "tip": "MLflow official docs + track a Kaggle experiment"},
+    "Kubeflow":           {"d": "Advanced",     "w": 6,  "pre": ["Kubernetes", "Machine Learning"], "tip": "Kubeflow docs + Google Cloud ML pipelines"},
+    "Grafana":            {"d": "Beginner",     "w": 2,  "pre": [],                      "tip": "Grafana Play + official tutorials (play.grafana.org)"},
+    "Splunk":             {"d": "Intermediate", "w": 4,  "pre": [],                      "tip": "Splunk Free Training + Splunk Fundamentals 1"},
+    # ── Security ──────────────────────────────────────────────────────────────
+    "Information Security": {"d": "Intermediate", "w": 16, "pre": ["Linux"],            "tip": "CompTIA Security+ + TryHackMe + OWASP Top 10"},
+    "SIEM":               {"d": "Intermediate", "w": 6,  "pre": ["Cybersecurity"],       "tip": "Splunk SIEM training + Microsoft Sentinel docs"},
+    "Penetration Testing": {"d": "Advanced",    "w": 20, "pre": ["Linux", "Cybersecurity"], "tip": "eLearnSecurity + Hack The Box + OSCP prep"},
+    "Encryption":         {"d": "Intermediate", "w": 4,  "pre": [],                      "tip": "Cryptography I (Coursera Stanford) + OpenSSL docs"},
+    "OAuth":              {"d": "Intermediate", "w": 3,  "pre": [],                      "tip": "OAuth 2.0 simplified (aaronparecki.com) + Auth0 docs"},
+    "SSO":                {"d": "Intermediate", "w": 3,  "pre": ["OAuth"],               "tip": "SAML/OAuth/OIDC tutorials + Okta developer docs"},
+    "Zero Trust":         {"d": "Advanced",     "w": 6,  "pre": ["Cybersecurity"],       "tip": "NIST Zero Trust Architecture (SP 800-207) + BeyondCorp"},
+    "NIST":               {"d": "Intermediate", "w": 4,  "pre": [],                      "tip": "NIST Cybersecurity Framework (official site)"},
+    "ISO 27001":          {"d": "Intermediate", "w": 6,  "pre": [],                      "tip": "ISO 27001 Annex A controls + Udemy course"},
+    # ── Tools & Methodologies ────────────────────────────────────────────────
+    "Jira":               {"d": "Beginner",     "w": 1,  "pre": ["Agile"],              "tip": "Atlassian Jira fundamentals (free certification)"},
+    "Confluence":         {"d": "Beginner",     "w": 1,  "pre": [],                      "tip": "Atlassian Confluence docs + Space creation tutorial"},
+    "Postman":            {"d": "Beginner",     "w": 1,  "pre": [],                      "tip": "Postman Learning Center + API testing tutorial"},
+    "Swagger":            {"d": "Beginner",     "w": 1,  "pre": ["RESTful API"],         "tip": "Swagger.io docs + OpenAPI Specification guide"},
+    "Datadog":            {"d": "Intermediate", "w": 3,  "pre": [],                      "tip": "Datadog Learning Center (free labs)"},
+    "New Relic":          {"d": "Intermediate", "w": 2,  "pre": [],                      "tip": "New Relic University free courses"},
+    "Scrum":              {"d": "Beginner",     "w": 2,  "pre": [],                      "tip": "Scrum Guide (scrumguides.org) + PSM I cert"},
+    "Kanban":             {"d": "Beginner",     "w": 1,  "pre": [],                      "tip": "Kanban Guide + Trello or Jira kanban board"},
+    "TDD":                {"d": "Intermediate", "w": 4,  "pre": [],                      "tip": "Kent Beck's TDD book + pytest/Jest tutorials"},
+    "RESTful API":        {"d": "Intermediate", "w": 3,  "pre": [],                      "tip": "REST API design guide (restfulapi.net) + build one"},
+    "gRPC":               {"d": "Intermediate", "w": 3,  "pre": ["Protocol Buffers"],    "tip": "gRPC official docs + language-specific quickstart"},
+    # ── Programming Languages ────────────────────────────────────────────────
+    "C#":                 {"d": "Intermediate", "w": 10, "pre": [],                      "tip": "Microsoft Learn C# fundamentals + Build .NET apps"},
+    "C++":                {"d": "Advanced",     "w": 16, "pre": [],                      "tip": "LearnCpp.com + competitive programming practice"},
+    "Ruby":               {"d": "Intermediate", "w": 8,  "pre": [],                      "tip": "Ruby Koans + The Odin Project Ruby path"},
+    "PHP":                {"d": "Beginner",     "w": 6,  "pre": [],                      "tip": "PHP.net manual + Laracasts PHP for beginners"},
+    "Swift":              {"d": "Intermediate", "w": 8,  "pre": [],                      "tip": "Swift.org tutorials + Hacking with Swift"},
+    "Scala":              {"d": "Advanced",     "w": 12, "pre": ["Java"],                "tip": "Scala.lang.org tour + Coursera Functional Programming"},
+    "Perl":               {"d": "Intermediate", "w": 6,  "pre": [],                      "tip": "Perl.org docs + Learning Perl (O'Reilly)"},
+    "MATLAB":             {"d": "Intermediate", "w": 6,  "pre": [],                      "tip": "MathWorks MATLAB Onramp (free online)"},
+    "Dart":               {"d": "Intermediate", "w": 5,  "pre": [],                      "tip": "Dart.dev language tour + Flutter codelabs"},
+    "Haskell":            {"d": "Advanced",     "w": 16, "pre": [],                      "tip": "Learn You a Haskell (free online book)"},
+    "Bash":               {"d": "Beginner",     "w": 3,  "pre": ["Linux"],               "tip": "Bash scripting tutorial + shellcheck.net"},
+    "PowerShell":         {"d": "Beginner",     "w": 3,  "pre": [],                      "tip": "Microsoft Learn PowerShell path"},
+    "HTML":               {"d": "Beginner",     "w": 2,  "pre": [],                      "tip": "MDN HTML basics + freeCodeCamp responsive design"},
+    "CSS":                {"d": "Beginner",     "w": 3,  "pre": ["HTML"],                "tip": "MDN CSS basics + CSS Tricks guides"},
 }
+
+# ═══════════════════════════════════════════════════════════════════════
+#  DB / JSON field helpers
+# ═══════════════════════════════════════════════════════════════════════
+
+def _get_tags(job: Dict) -> List[str]:
+    """Normalise le champ tags en list[str], compatible DB et fichiers JSON.
+
+    Contextes possibles :
+    - get_jobs_for_user (DB)   : tags = row["requirements"] → string CSV ou None
+    - _refresh_market_analysis : tags = list[str] déjà découpé dans main.py
+    - load_all_jobs (JSON)     : tags = list[str]
+    Fallback : lit skills_req (must_have DB) et skills_bon (nice_to_have DB).
+    """
+    raw = job.get("tags", [])
+    if isinstance(raw, list):
+        return [t.strip() for t in raw if t.strip()]
+    if isinstance(raw, str) and raw.strip():
+        return [t.strip() for t in raw.split(",") if t.strip()]
+    combined = ", ".join(filter(None, [
+        job.get("skills_req", "") or "",
+        job.get("must_have",  "") or "",
+        job.get("skills_bon", "") or "",
+        job.get("nice_to_have", "") or "",
+    ]))
+    return [t.strip() for t in combined.split(",") if t.strip()]
+
+
+def _get_company(job: Dict) -> str:
+    """Retourne le nom de l'entreprise/secteur.
+
+    DB jobs : colonne "industry" (pas de colonne "company").
+    main.py : mappe industry → "company" pour MarketAnalysis.
+    JSON    : peut avoir "company" directement.
+    """
+    return (job.get("industry") or job.get("company") or "").strip()
+
+
+def _get_skills_blob(job: Dict) -> str:
+    """Texte complet pour extraction de skills.
+
+    Inclut title + description + tags + must_have + nice_to_have.
+    must_have/nice_to_have (DB) sont les sources les plus fiables.
+    """
+    parts = [
+        job.get("title", "") or "",
+        job.get("description", "") or "",
+        " ".join(_get_tags(job)),
+        job.get("skills_req", "") or "",
+        job.get("must_have",  "") or "",
+        job.get("skills_bon", "") or "",
+        job.get("nice_to_have", "") or "",
+    ]
+    return " ".join(filter(None, parts))
+
 
 # ═══════════════════════════════════════════════════════════════════════
 #  Salary Parser
@@ -272,7 +419,8 @@ class MarketAnalysis:
         self.skill_by_cat: Dict[str, Counter] = defaultdict(Counter)
         self._job_skills: Dict[int, Set[str]] = {}
         for idx, j in enumerate(jobs):
-            blob = " ".join([j.get("title", ""), j.get("description", ""), " ".join(j.get("tags", []))])
+            # _get_skills_blob inclut title+description+tags+skills_req+skills_bon
+            blob = _get_skills_blob(j)
             skills = extract_skills_set(blob)
             self._job_skills[idx] = skills
             for s in skills:
@@ -292,14 +440,16 @@ class MarketAnalysis:
             self.salary_by_currency[s["currency"]].append(_annualise(s))
 
         self.locations = Counter(j.get("location", "").strip() for j in jobs if j.get("location", "").strip())
-        self.companies = Counter(j.get("company", "").strip() for j in jobs if j.get("company", "").strip())
+        # industry DB remappé "company" par main.py, ou "company" direct dans fichiers JSON
+        self.companies = Counter(_get_company(j) for j in jobs if _get_company(j))
 
         remote_kw = re.compile(r"\bremote\b", re.IGNORECASE)
         self.remote_ratio = sum(
             1 for j in jobs
-            if remote_kw.search(j.get("title", ""))
-            or remote_kw.search(j.get("location", ""))
-            or any(remote_kw.search(t) for t in j.get("tags", []))
+            if remote_kw.search(j.get("title", "") or "")
+            or remote_kw.search(j.get("location", "") or "")
+            or remote_kw.search(j.get("remote", "") or "")          # champ "remote" DB
+            or any(remote_kw.search(t) for t in _get_tags(j))       # tags normalisés
         ) / max(self.total, 1)
 
     def job_skills(self, idx: int) -> Set[str]:
@@ -436,7 +586,24 @@ def score_job_fit(
     matched = {s for s in job_skills if s.lower() in candidate_lower}
     missing = job_skills - matched
 
-    skill_score = len(matched) / max(len(job_skills), 1) * 100
+    # Si gap_missing est disponible depuis la DB → l'utiliser (plus précis que l'extraction regex)
+    db_gap_missing = job.get("gap_missing", [])
+    if db_gap_missing:
+        missing = missing | set(db_gap_missing)
+        # matched = skills_req - gap_missing (recalcul cohérent avec DB)
+        skills_req_str = job.get("skills_req") or job.get("must_have") or ""
+        if skills_req_str:
+            all_req = {s.strip() for s in skills_req_str.split(",") if s.strip()}
+            missing_lower = {s.lower() for s in db_gap_missing}
+            matched = {s for s in all_req if s.lower() not in missing_lower}
+
+    # Si match_score DB disponible (AI BiEncoder 0.0-1.0) → l'utiliser comme base
+    db_match = job.get("match_score")
+    if db_match is not None and db_match >= 0:
+        # match_score DB est le score AI principal → poids fort
+        skill_score = float(db_match) * 100
+    else:
+        skill_score = len(matched) / max(len(job_skills), 1) * 100
 
     job_loc = job.get("location", "").lower()
     location_score = 50
@@ -545,7 +712,7 @@ def print_matches(matches: List[Dict], profile: CandidateProfile):
         sal = _safe(j.get("salary", "") or "Not disclosed")
         loc = _safe(j.get("location", "") or "Not specified")
         title = _safe(j.get("title", "Untitled"))
-        company = _safe(j.get("company", ""))
+        company = _safe(_get_company(j))
         print(f"  [{rank:>2}] {m['verdict']} ({m['total']}% fit)")
         print(f"       {title}")
         print(f"       {company}  |  {loc}  |  {sal}")
@@ -719,12 +886,25 @@ def generate_report(
     for rank, m in enumerate(matches[:15], 1):
         j = m["job"]
         lines.append(f"### [{rank}] {j.get('title', '')} -- {m['verdict']} ({m['total']}%)")
-        lines.append(f"- **Company**: {j.get('company', '')}")
+        lines.append(f"- **Company**: {_get_company(j)}")
         lines.append(f"- **Location**: {j.get('location', '') or 'N/A'}")
+        if j.get("experience") or j.get("seniority"):
+            lines.append(f"- **Seniority**: {j.get('experience') or j.get('seniority', '')}")
         lines.append(f"- **Salary**: {j.get('salary', '') or 'Not disclosed'}")
         lines.append(f"- **Your matching skills**: {', '.join(m['matched'][:10]) or 'N/A'}")
         if m["missing"]:
             lines.append(f"- **Skills to develop**: {', '.join(m['missing'][:8])}")
+        # Scores DB si disponibles
+        ms = j.get("match_score")
+        cs = j.get("cosine")
+        if ms is not None and ms >= 0:
+            lines.append(f"- **AI Match Score**: {ms*100:.1f}%")
+        if cs is not None and cs > 0:
+            lines.append(f"- **Cosine Score**: {cs*100:.1f}%")
+        if j.get("contract"):
+            lines.append(f"- **Contract**: {j.get('contract')}")
+        if j.get("remote"):
+            lines.append(f"- **Remote**: {j.get('remote')}")
         lines.append(f"- **Apply**: {j.get('url', '')}")
         lines.append("")
 
@@ -940,7 +1120,7 @@ def interactive_loop(
             j = m["job"]
             print(f"\n  {'=' * 56}")
             print(f"  Job:      {_safe(j.get('title', ''))}")
-            print(f"  Company:  {_safe(j.get('company', ''))}")
+            print(f"  Company:  {_safe(_get_company(j))}")
             print(f"  Location: {_safe(j.get('location', '') or 'N/A')}")
             print(f"  Salary:   {_safe(j.get('salary', '') or 'Not disclosed')}")
             print(f"  Source:   {j.get('source', '')}")
@@ -994,6 +1174,7 @@ def interactive_loop(
         elif action in ("market", "6"):
             print("\n" + analysis.summary_text())
             print("\n  Top hiring companies:")
+            # companies déjà normalisé via _get_company() dans __init__
             for co, cnt in analysis.companies.most_common(10):
                 print(f"    {co:<35} {cnt} positions")
             print()

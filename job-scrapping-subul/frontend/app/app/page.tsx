@@ -3,7 +3,8 @@
 //  app/app/page.tsx  —  DASHBOARD
 // ─────────────────────────────────────────────────────────────────────────────
 
-import { useState, useEffect, useRef, Suspense } from "react";
+import { useState, useEffect, useRef, Suspense, useCallback } from "react";
+import { useVoice, type VoiceState } from "@/app/lib/useVoice";
 import { useRouter, useSearchParams } from "next/navigation";
 import {
   GRAD, FONT, MONO, C, S, GLOBAL_CSS,
@@ -394,12 +395,81 @@ function ScanningBanner({ pipeSteps, pipeRole, enrichN }: {
 //  ChatSidebar
 // ─────────────────────────────────────────────────────────────────────────────
 
-function ChatSidebar({ userId }: { userId: number }) {
+// ── Couleurs état voice ───────────────────────────────────────────────────────
+const VOICE_COLORS: Record<string, string> = {
+  idle:       C.p1,
+  listening:  "#e53e3e",   // rouge pulsant = en écoute
+  processing: "#d69e2e",   // jaune = traitement STT
+  speaking:   "#38a169",   // vert = lecture TTS
+  error:      "#e53e3e",
+};
+
+// ── Icône micro SVG inline ─────────────────────────────────────────────────
+function MicIcon({ size = 16, color = "currentColor" }: { size?: number; color?: string }) {
+  return (
+    <svg width={size} height={size} viewBox="0 0 24 24" fill="none" stroke={color}
+      strokeWidth="2" strokeLinecap="round" strokeLinejoin="round">
+      <path d="M12 1a3 3 0 0 0-3 3v8a3 3 0 0 0 6 0V4a3 3 0 0 0-3-3z"/>
+      <path d="M19 10v2a7 7 0 0 1-14 0v-2"/>
+      <line x1="12" y1="19" x2="12" y2="23"/>
+      <line x1="8"  y1="23" x2="16" y2="23"/>
+    </svg>
+  );
+}
+
+// ── Icône stop ─────────────────────────────────────────────────────────────
+function StopIcon({ size = 14, color = "currentColor" }: { size?: number; color?: string }) {
+  return (
+    <svg width={size} height={size} viewBox="0 0 24 24" fill={color}>
+      <rect x="4" y="4" width="16" height="16" rx="2"/>
+    </svg>
+  );
+}
+
+// ── Icône speaker ──────────────────────────────────────────────────────────
+function SpeakerIcon({ size = 14, color = "currentColor" }: { size?: number; color?: string }) {
+  return (
+    <svg width={size} height={size} viewBox="0 0 24 24" fill="none" stroke={color}
+      strokeWidth="2" strokeLinecap="round" strokeLinejoin="round">
+      <polygon points="11 5 6 9 2 9 2 15 6 15 11 19 11 5"/>
+      <path d="M15.54 8.46a5 5 0 0 1 0 7.07"/>
+      <path d="M19.07 4.93a10 10 0 0 1 0 14.14"/>
+    </svg>
+  );
+}
+
+function ChatSidebar({ userId, jobs = [] }: { userId: number; jobs?: Job[] }) {
   const [msgs,    setMsgs]    = useState<Message[]>([]);
   const [input,   setInput]   = useState("");
   const [loading, setLoading] = useState(false);
   const [chatErr, setChatErr] = useState("");
+  const [ttsEnabled, setTtsEnabled] = useState(true);  // TTS activé par défaut
   const endRef = useRef<HTMLDivElement>(null);
+
+  // ── Détection langue active (fr/en) pour STT + TTS ───────────────────────
+  const [activeLang, setActiveLang] = useState<"fr" | "en">("fr");
+
+  // ── Hook Voice ────────────────────────────────────────────────────────────
+  const {
+    voiceState, voiceError, detectedLang,
+    startListening, stopListening, speakText, cancelSpeech,
+  } = useVoice({
+    defaultLang:        activeLang,       // langue par défaut (toggle FR/EN)
+    silenceThresholdMs: 2000,             // 2s silence → arrêt auto
+    silenceRmsThreshold: 0.012,
+    onTranscript: (text: string, lang: string) => {
+      // lang = langue détectée par Deepgram ("fr" ou "en")
+      // On met à jour activeLang pour que le TTS suive automatiquement
+      setActiveLang(lang as "fr" | "en");
+      setInput(text);
+      setTimeout(() => sendVoice(text, lang), 100);
+    },
+  });
+
+  const isListening  = voiceState === "listening";
+  const isProcessing = voiceState === "processing";
+  const isSpeaking   = voiceState === "speaking";
+  const micBusy      = voiceState !== "idle" && voiceState !== "error";
 
   // ── Charger l'historique depuis la DB au montage ──────────────────────────
   useEffect(() => {
@@ -412,74 +482,262 @@ function ChatSidebar({ userId }: { userId: number }) {
 
   // ── Écouter l'event logout → vider les msgs locaux ────────────────────────
   useEffect(() => {
-    const handleLogout = () => setMsgs([]);
+    const handleLogout = () => { setMsgs([]); cancelSpeech(); };
     window.addEventListener("jobscan:logout", handleLogout);
     return () => window.removeEventListener("jobscan:logout", handleLogout);
-  }, []);
+  }, [cancelSpeech]);
 
   useEffect(() => { endRef.current?.scrollIntoView({ behavior: "smooth" }); }, [msgs]);
 
-  async function send() {
-    const msg = input.trim();
-    if (!msg) return;
-    setInput(""); setChatErr("");
+  // ── Fonction d'envoi commune (texte + voice) ─────────────────────────────
+  async function _sendMessage(msg: string, voiceLang?: string) {
+    if (!msg.trim() || loading) return;
+    setInput("");
+    setChatErr("");
     setMsgs(p => [...p, { role: "user", content: msg }]);
     setLoading(true);
+
+    // Construire jobs_context pour le contexte LLM
+    const jobsContext = jobs.slice(0, 30).map(j => ({
+      title:      j.title,
+      industry:   j.industry,
+      location:   j.location,
+      salary:     j.salary,
+      remote:     j.remote,
+      contract:   j.contract,
+      experience: j.experience,
+      match_score: normalizeScore(j.match_score),
+      cosine:      normalizeScore(j.cosine ?? j.cosine_score),
+      missing:     j.gap_missing || [],
+      url:         j.url,
+      source:      j.source,
+    }));
+
     try {
       const r = await fetch("/api/chat", {
-        method: "POST", headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({ user_id: String(userId), message: msg }),
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({
+          user_id:      String(userId),
+          message:      msg,
+          jobs_context: jobsContext,
+        }),
       });
       if (!r.ok) { setChatErr(`Server error ${r.status}`); return; }
       const d = await r.json();
       if (d.response) {
         setMsgs(p => [...p, { role: "assistant", content: d.response }]);
+        // Lire la réponse si TTS activé
+        if (ttsEnabled) {
+          // voiceLang = langue détectée par Deepgram STT
+          // → Deepgram TTS répondra avec le même accent (FR→FR, EN→EN)
+          const ttsLang = voiceLang || detectedLang || activeLang;
+          await speakText(d.response, ttsLang);
+        }
       } else {
         setChatErr("Empty response from server.");
       }
     } catch {
       setChatErr("Connection error — is the backend running?");
-    } finally { setLoading(false); }
+    } finally {
+      setLoading(false);
+    }
   }
 
+  // Envoi depuis bouton / Enter (texte classique)
+  const send = useCallback(() => {
+    const msg = input.trim();
+    if (!msg) return;
+    // Texte tapé → TTS répondra dans la langue du toggle (activeLang)
+    _sendMessage(msg, activeLang);
+  }, [input, loading, activeLang]); // eslint-disable-line react-hooks/exhaustive-deps
+
+  // Envoi depuis voice transcript — on mémorise la langue pour le TTS
+  const sendVoice = useCallback((text: string, lang?: string) => {
+    _sendMessage(text, lang);
+  }, [loading]); // eslint-disable-line react-hooks/exhaustive-deps
+
+  // ── Gestion bouton micro ──────────────────────────────────────────────────
+  const handleMicClick = () => {
+    if (isSpeaking) {
+      cancelSpeech();
+      return;
+    }
+    if (isListening) {
+      stopListening();
+      return;
+    }
+    if (!micBusy) {
+      startListening();
+    }
+  };
+
+  // ── Label tooltip micro ───────────────────────────────────────────────────
+  const micTooltip = isListening  ? "Cliquez pour arrêter (ou silence 2s)"
+                   : isProcessing ? "Transcription en cours…"
+                   : isSpeaking   ? "Cliquez pour arrêter la lecture"
+                   : "Cliquez pour parler";
+
+  const micColor = VOICE_COLORS[voiceState] || C.p1;
+
   return (
-    <div style={{ width: 272, flexShrink: 0, background: C.white, border: `1px solid ${C.border}`, borderRadius: 16, padding: "14px 16px", display: "flex", flexDirection: "column", height: "calc(100vh - 112px)", position: "sticky", top: 72, boxShadow: "0 2px 12px rgba(122,63,176,.07)" }}>
-      <div style={{ fontWeight: 700, fontSize: 13, color: C.p1, marginBottom: 12 }}>💬 Career Assistant Chat</div>
-      <div style={{ flex: 1, overflowY: "auto", display: "flex", flexDirection: "column", gap: 8, paddingRight: 2 }}>
+    <div style={{
+      width: 340, flexShrink: 0, background: C.white,
+      border: `1px solid ${C.border}`, borderRadius: 20,
+      padding: "18px 20px", display: "flex", flexDirection: "column",
+      height: "calc(100vh - 112px)", position: "sticky", top: 72,
+      boxShadow: "0 4px 24px rgba(122,63,176,.11)",
+    }}>
+
+      {/* ── Header chat ── */}
+      <div style={{ display: "flex", alignItems: "center", justifyContent: "space-between", marginBottom: 14, paddingBottom: 12, borderBottom: `1px solid ${C.border}` }}>
+        <div style={{ fontWeight: 800, fontSize: 14, color: C.p1, letterSpacing: -0.3 }}>💬 Career Assistant</div>
+
+        {/* Contrôles header : langue + TTS toggle */}
+        <div style={{ display: "flex", alignItems: "center", gap: 6 }}>
+          {/* Toggle langue STT/TTS */}
+          <button
+            title={`Langue : ${activeLang.toUpperCase()} — cliquez pour changer`}
+            onClick={() => setActiveLang(l => l === "fr" ? "en" : "fr")}
+            style={{
+              fontSize: 10, fontWeight: 700, color: C.muted,
+              background: "none", border: `1px solid ${C.border}`,
+              borderRadius: 4, padding: "2px 5px", cursor: "pointer",
+              letterSpacing: 0.5,
+            }}
+          >
+            {activeLang.toUpperCase()}
+          </button>
+
+          {/* Toggle TTS on/off */}
+          <button
+            title={ttsEnabled ? "Désactiver la lecture vocale" : "Activer la lecture vocale"}
+            onClick={() => { setTtsEnabled(v => !v); if (isSpeaking) cancelSpeech(); }}
+            style={{
+              background: "none", border: "none", cursor: "pointer",
+              opacity: ttsEnabled ? 1 : 0.35, padding: 2,
+              display: "flex", alignItems: "center",
+            }}
+          >
+            <SpeakerIcon size={15} color={C.muted} />
+          </button>
+        </div>
+      </div>
+
+      {/* ── Messages ── */}
+      <div style={{
+        flex: 1, overflowY: "auto", display: "flex",
+        flexDirection: "column", gap: 10, paddingRight: 4,
+      }}>
         {msgs.length === 0 && (
-          <div style={{ fontSize: 11, color: C.muted, textAlign: "center", marginTop: 20, lineHeight: 1.7 }}>
+          <div style={{ fontSize: 12, color: C.muted, textAlign: "center", marginTop: 32, lineHeight: 1.9, padding: "0 10px" }}>
+            <div style={{ fontSize: 28, marginBottom: 10 }}>🤖</div>
             Ask me about your job matches, skills gap, roadmap or score explanations.
+            <div style={{ marginTop: 10, fontSize: 11, opacity: 0.6 }}>🎙 Click the mic to speak</div>
           </div>
         )}
         {msgs.map((m, i) => (
           <div key={i} style={{
-            padding: "8px 12px", borderRadius: 8, fontSize: 12, lineHeight: 1.6,
+            padding: "10px 14px", borderRadius: 14, fontSize: 13, lineHeight: 1.65,
             ...(m.role === "user"
-              ? { background: "rgba(122,63,176,.07)", borderRight: `3px solid ${C.p1}`, alignSelf: "flex-end",   maxWidth: "88%" }
-              : { background: C.bg,                  borderLeft:  `3px solid ${C.p2}`, alignSelf: "flex-start", maxWidth: "95%" }
+              ? { background: `linear-gradient(135deg, rgba(122,63,176,.13), rgba(122,63,176,.07))`, borderRight: `3px solid ${C.p1}`, alignSelf: "flex-end",   maxWidth: "88%", borderBottomRightRadius: 4 }
+              : { background: C.bg, border: `1px solid ${C.border}`,                                 alignSelf: "flex-start", maxWidth: "95%", borderBottomLeftRadius: 4 }
             ),
           }}>
             {m.content.split("\n").map((l, j) => <div key={j}>{l || " "}</div>)}
           </div>
         ))}
-        {loading && <div style={{ fontSize: 11, color: "#9f8fb0", padding: "6px 12px" }}>Thinking…</div>}
+        {loading && (
+          <div style={{ fontSize: 11, color: "#9f8fb0", padding: "6px 12px", display: "flex", gap: 4, alignItems: "center" }}>
+            <span>Thinking</span>
+            {[0,150,300].map(d => (
+              <div key={d} style={{
+                width: 5, height: 5, borderRadius: "50%", background: "#9f8fb0",
+                animation: `bounce 0.9s ${d}ms ease-in-out infinite`,
+              }}/>
+            ))}
+          </div>
+        )}
         {chatErr && <div style={{ fontSize: 11, color: C.red, padding: "4px 12px" }}>⚠ {chatErr}</div>}
+
+        {/* Status voice */}
+        {voiceState !== "idle" && (
+          <div style={{
+            fontSize: 10, color: micColor, padding: "4px 10px",
+            background: `${micColor}12`, borderRadius: 6,
+            display: "flex", alignItems: "center", gap: 6,
+          }}>
+            {isListening  && <><span style={{ animation: "pulse 1s ease-in-out infinite" }}>🔴</span> Écoute en cours ({activeLang.toUpperCase()})… silence 2s pour arrêter</>}
+            {isProcessing && <><span>⏳</span> Transcription…</>}
+            {isSpeaking   && <><span>🔊</span> Lecture vocale… <button onClick={cancelSpeech} style={{ fontSize: 9, color: C.muted, background: "none", border: "none", cursor: "pointer", textDecoration: "underline" }}>stop</button></>}
+          </div>
+        )}
+        {voiceError && (
+          <div style={{ fontSize: 10, color: C.red, padding: "4px 10px", background: "#fff0f0", borderRadius: 6 }}>
+            ⚠ {voiceError}
+          </div>
+        )}
+
         <div ref={endRef} />
       </div>
-      <div style={{ display: "flex", gap: 8, marginTop: 10 }}>
+
+      {/* ── Zone de saisie ── */}
+      <div style={{ display: "flex", gap: 8, marginTop: 12, alignItems: "center", paddingTop: 12, borderTop: `1px solid ${C.border}` }}>
+
+        {/* Bouton micro */}
+        <button
+          title={micTooltip}
+          onClick={handleMicClick}
+          disabled={isProcessing}
+          style={{
+            width: 38, height: 38, borderRadius: "50%", flexShrink: 0,
+            border: `2px solid ${micColor}`,
+            background: isListening ? `${micColor}18` : "white",
+            cursor: isProcessing ? "not-allowed" : "pointer",
+            display: "flex", alignItems: "center", justifyContent: "center",
+            transition: "all .2s",
+            animation: isListening ? "pulse 1.2s ease-in-out infinite" : "none",
+            opacity: isProcessing ? 0.6 : 1,
+          }}
+        >
+          {isSpeaking
+            ? <StopIcon  size={14} color={micColor} />
+            : isListening
+            ? <StopIcon  size={14} color={micColor} />
+            : <MicIcon   size={16} color={micColor} />
+          }
+        </button>
+
+        {/* Input texte */}
         <input
           style={{ ...S.input, fontSize: 12, flex: 1 }}
-          placeholder="Ask anything…"
+          placeholder={isListening ? "Parlez maintenant…" : "Ask anything…"}
           value={input}
           onChange={e => setInput(e.target.value)}
           onKeyDown={e => e.key === "Enter" && !loading && send()}
+          disabled={isListening || isProcessing}
         />
-        <button style={{ ...S.btn, padding: "8px 14px", fontSize: 12 }} onClick={send} disabled={loading}>→</button>
+
+        {/* Bouton envoyer */}
+        <button
+          style={{ ...S.btn, padding: "8px 14px", fontSize: 12 }}
+          onClick={send}
+          disabled={loading || isListening || isProcessing}
+        >
+          →
+        </button>
       </div>
+
+      {/* CSS animations inline */}
+      <style>{`
+        @keyframes pulse {
+          0%, 100% { transform: scale(1);   opacity: 1; }
+          50%       { transform: scale(1.1); opacity: 0.8; }
+        }
+      `}</style>
     </div>
   );
 }
-
 // ─────────────────────────────────────────────────────────────────────────────
 //  MatchesTab
 // ─────────────────────────────────────────────────────────────────────────────
@@ -544,7 +802,7 @@ function MatchesTab({ isScanning, scanJobs, jobs, jobsLoad, roleFilter, setRoleF
 
       {!isScanning && jobs.length > 0 && (
         <div style={{ display: "grid", gridTemplateColumns: "repeat(auto-fill,minmax(310px,1fr))", gap: 14 }}>
-          {jobs.map(job => <JobCard key={job.url} job={job} />)}
+          {jobs.map((job, i) => <JobCard key={`${job.url}-${i}`} job={job} />)}
         </div>
       )}
     </div>
@@ -628,10 +886,16 @@ function Dashboard() {
           try { d = JSON.parse(chunk.slice(6)); } catch { continue; }
           if (d.event === "no_cache") break;
           if (d.event === "job")      loaded.push(d as Job);
-          if (d.event === "done")   { setJobs(loaded); break; }
+          if (d.event === "done")   { break; }
         }
       }
-      setJobs(loaded);
+      // Dédupliquer par URL (évite les doublons de la DB)
+      const seen = new Set<string>();
+      const unique = loaded.filter(j => {
+        if (seen.has(j.url)) return false;
+        seen.add(j.url); return true;
+      });
+      setJobs(unique);
     } finally { setJobsLoad(false); }
   }
 
