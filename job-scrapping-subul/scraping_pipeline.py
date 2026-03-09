@@ -38,6 +38,7 @@ from sentence_transformers import SentenceTransformer
 import matcher as mtch
 from database import upsert_user, insert_job
 from llm_extractor import extract_with_llm
+from xai_explainer import explain_job_match, _fallback_xai
 from scraper import (
     scrape_aijobs,
     scrape_emploitic,
@@ -461,6 +462,34 @@ async def pipeline(cv_text: str, user_id: int = 0):
 
                     combined_score = mtch.compute_combined_score(match_score, gap)
 
+                    # ── Explainable AI (LLM-as-judge) ─────────────────────────
+                    xai_payload = None
+                    try:
+                        xai_payload = await explain_job_match(
+                            job_title=details.get("title") or job.get("title", ""),
+                            job_skills_req=details.get("skills_req", "") or details.get("all_skills", ""),
+                            gap_matched=gap.get("matched", []),
+                            gap_missing=gap.get("missing", []),
+                            gap_coverage=gap.get("coverage", 1.0),
+                            gap_total=gap.get("total", 0),
+                            cv_role=cv_structured.get("role", "Software Engineer"),
+                            cv_skills_summary=cv_structured.get("skills", "")[:500],
+                            cosine=cosine,
+                            match_score=match_score,
+                            combined_score=combined_score,
+                        )
+                    except Exception as xai_err:
+                        logger.debug("[pipeline] xai explainer skip: %s", xai_err)
+                    if xai_payload is None:
+                        xai_payload = _fallback_xai(
+                            cosine, match_score, combined_score,
+                            gap.get("coverage", 1.0), gap.get("total", 0),
+                        )
+                        logger.info("[xai] fallback — %s", (details.get("title") or job.get("title", ""))[:50])
+                    else:
+                        logger.info("[xai] LLM — %s", (details.get("title") or job.get("title", ""))[:50])
+                    # xai_payload is always set (LLM or fallback) so every card has xai for the frontend
+
                     logger.info(
                         f"  ✦ {job['title'][:35]:35s} [{source:9s}] "
                         f"cos={cosine:.2f} ai={match_score:.2f} "
@@ -490,6 +519,7 @@ async def pipeline(cv_text: str, user_id: int = 0):
                         "gap_matched":  gap["matched"],
                         "gap_coverage": gap["coverage"],
                         "gap_total":    gap["total"],
+                        "xai":          xai_payload,
                         "contract":    details.get("contract", "")   or job.get("_emp_contract", ""),
                         "experience":  details.get("experience", "") or job.get("_emp_experience", ""),
                         "education":   details.get("education", "")  or job.get("_emp_education", ""),

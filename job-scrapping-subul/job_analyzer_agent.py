@@ -253,6 +253,24 @@ LEARNING_META: Dict[str, Dict[str, Any]] = {
     "CSS":                {"d": "Beginner",     "w": 3,  "pre": ["HTML"],                "tip": "MDN CSS basics + CSS Tricks guides"},
 }
 
+def sanitize_learning_tip(tip: str) -> str:
+    """Remove references to external learning platforms so roadmap tips stay in-app."""
+    if not (tip and tip.strip()):
+        return "Practice with official documentation and hands-on projects."
+    # Remove phrases that direct users to other platforms (Coursera, Udemy, etc.)
+    patterns = [
+        r"\s*[+&]\s*Coursera[^.]*\.?", r"\s*[+&]\s*Udemy[^.]*\.?",
+        r"\s*[+&]\s*DataCamp[^.]*\.?", r"\s*[+&]\s*Pluralsight[^.]*\.?",
+        r"\s*[+&]\s*edX[^.]*\.?", r"\s*[+&]\s*LinkedIn Learning[^.]*\.?",
+        r"Coursera specialisation[^.]*\.?", r"Udemy course[^.]*\.?",
+        r"\(Coursera[^)]*\)", r"\(Udemy[^)]*\)", r"IBM/Coursera[^.]*\.?",
+    ]
+    out = tip
+    for p in patterns:
+        out = re.sub(p, " ", out, flags=re.IGNORECASE)
+    out = " ".join(out.split()).strip()
+    return out or "Practice with official documentation and hands-on projects."
+
 # ═══════════════════════════════════════════════════════════════════════
 #  DB / JSON field helpers
 # ═══════════════════════════════════════════════════════════════════════
@@ -286,8 +304,45 @@ def _get_company(job: Dict) -> str:
     DB jobs : colonne "industry" (pas de colonne "company").
     main.py : mappe industry → "company" pour MarketAnalysis.
     JSON    : peut avoir "company" directement.
+
+    Exclut les valeurs qui sont en réalité un salaire, un titre de poste, ou du bruit.
     """
-    return (job.get("industry") or job.get("company") or "").strip()
+    raw = (job.get("industry") or job.get("company") or "").strip()
+    if not raw:
+        return ""
+    if not _is_likely_company_name(raw):
+        return ""
+    return raw
+
+
+def _is_likely_company_name(s: str) -> bool:
+    """Return False if s looks like salary, job title, or noise — not a company name."""
+    if len(s) < 2 or len(s) > 80:
+        return False
+    lower = s.lower()
+    # Salary patterns
+    if lower.startswith("salary:") or lower.startswith("salary "):
+        return False
+    if re.search(r"\$\s*[\d,]+", s):  # $90,000 or $ 90 000
+        return False
+    if re.search(r"^\d+\s*(k|k€|eur|usd|gbp)\b", lower):  # 90k, 90k€
+        return False
+    # Job-title-like: long strings starting with role prefixes (skip short names like "Dataiku")
+    title_starts = (
+        "senior ", "junior ", "lead ", "principal ", "staff ", "back end", "back-end",
+        "front end", "front-end", "full stack", "fullstack", "software ", "product ",
+        "project ", "devops", "cloud ", "solution ", "application ",
+    )
+    if len(s) > 20 and lower.startswith(title_starts):
+        return False
+    # Obvious title: contains role word and is not very long (likely a title, not "X Inc.")
+    if len(s) < 50 and re.search(r"\b(developer|engineer|analyst|manager|director|architect)\b", lower):
+        return False
+    # Mostly digits or symbols
+    alpha = sum(1 for c in s if c.isalpha())
+    if alpha < len(s) * 0.5:
+        return False
+    return True
 
 
 def _get_skills_blob(job: Dict) -> str:
@@ -410,7 +465,7 @@ def extract_skills_by_cat(text: str) -> Dict[str, Set[str]]:
 # ═══════════════════════════════════════════════════════════════════════
 
 class MarketAnalysis:
-    def __init__(self, jobs: List[Dict]):
+    def __init__(self, jobs: List[Dict], requirement_counts: Optional[Counter] = None):
         self.total = len(jobs)
         self.jobs = jobs
         self.sources = Counter(j.get("source", "unknown") for j in jobs)
@@ -428,6 +483,9 @@ class MarketAnalysis:
             for cat, sset in extract_skills_by_cat(blob).items():
                 for s in sset:
                     self.skill_by_cat[cat][s] += 1
+
+        # Skills demanded in job requirements (must_have) from DB — can include skills not in taxonomy
+        self.requirement_counts: Counter = requirement_counts if requirement_counts is not None else Counter()
 
         self.salaries: List[Dict] = []
         for j in jobs:
@@ -728,8 +786,13 @@ def print_matches(matches: List[Dict], profile: CandidateProfile):
 
 def compute_gap(analysis: MarketAnalysis, skills: Set[str]) -> Dict[str, Any]:
     my_lower = {s.lower() for s in skills}
+    # Merge taxonomy-based counts with requirement-based counts (from job cards' must_have)
+    # so skills extracted on job cards appear in the gap when highly demanded
+    combined: Counter = Counter(analysis.skill_counts)
+    for skill, count in getattr(analysis, "requirement_counts", Counter()).items():
+        combined[skill] = max(combined.get(skill, 0), count)
     matched, missing = [], []
-    for skill, count in analysis.skill_counts.most_common():
+    for skill, count in combined.most_common():
         if skill.lower() in my_lower:
             matched.append((skill, count))
         else:
@@ -740,6 +803,49 @@ def compute_gap(analysis: MarketAnalysis, skills: Set[str]) -> Dict[str, Any]:
         "coverage": coverage,
         "total_market_skills": len(matched) + len(missing),
     }
+
+
+def order_missing_skills_by_prerequisites(
+    miss: List[Tuple[str, int]],
+    user_skills_lower: Set[str],
+) -> List[Tuple[str, int]]:
+    """
+    Reorder missing skills so prerequisites come first (intelligent order).
+    If A is a prerequisite of B and both are in the missing list, A appears before B.
+    Among skills with no pending prereqs, higher market demand (count) comes first.
+    """
+    if not miss:
+        return miss
+    missing_names_lower = {s.lower() for s, _ in miss}
+    # Prereqs that are in the missing list (must learn first)
+    def missing_prereqs(skill: str) -> List[str]:
+        pre = LEARNING_META.get(skill, {}).get("pre", [])
+        return [p for p in pre if p.lower() in missing_names_lower and p.lower() != skill.lower()]
+
+    ordered: List[Tuple[str, int]] = []
+    remaining = list(miss)
+    ordered_lower: Set[str] = set()
+
+    while remaining:
+        # Pick skills whose missing prereqs are all already in ordered
+        candidates = []
+        for skill, count in remaining:
+            pre_missing = missing_prereqs(skill)
+            if all(p.lower() in ordered_lower for p in pre_missing):
+                candidates.append((skill, count))
+        if not candidates:
+            # Cyclic or missing meta: append rest by demand
+            remaining.sort(key=lambda x: -x[1])
+            ordered.extend(remaining)
+            break
+        # Among candidates, take the one with highest demand (count), then remove from remaining
+        candidates.sort(key=lambda x: -x[1])
+        chosen_skill, chosen_count = candidates[0]
+        ordered.append((chosen_skill, chosen_count))
+        ordered_lower.add(chosen_skill.lower())
+        remaining = [(s, c) for s, c in remaining if s != chosen_skill]
+
+    return ordered
 
 # ═══════════════════════════════════════════════════════════════════════
 #  Roadmap Generation
@@ -886,7 +992,7 @@ def generate_report(
     for rank, m in enumerate(matches[:15], 1):
         j = m["job"]
         lines.append(f"### [{rank}] {j.get('title', '')} -- {m['verdict']} ({m['total']}%)")
-        lines.append(f"- **Company**: {_get_company(j)}")
+        lines.append(f"- **Company**: {_get_company(j) or j.get('company') or j.get('industry') or 'N/A'}")
         lines.append(f"- **Location**: {j.get('location', '') or 'N/A'}")
         if j.get("experience") or j.get("seniority"):
             lines.append(f"- **Seniority**: {j.get('experience') or j.get('seniority', '')}")

@@ -23,14 +23,15 @@ from fastapi import FastAPI, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import HTMLResponse, StreamingResponse
 from openai import AsyncAzureOpenAI
-from pydantic import BaseModel
+from pydantic import BaseModel, field_validator
 
 from database import (
-    init_db, close_pool, upsert_user, get_user, update_user_profile,
+    init_db, close_pool, upsert_user, get_user, get_jobs_for_user, update_user_profile,
 )
 from job_analyzer_agent import (
     CandidateProfile, MarketAnalysis, load_all_jobs,
     compute_gap, match_jobs, generate_roadmap, generate_report,
+    order_missing_skills_by_prerequisites, LEARNING_META, sanitize_learning_tip,
 )
 
 # ── Import des 3 modules ──────────────────────────────────────────────────────
@@ -92,6 +93,7 @@ async def _refresh_market_analysis():
     """Rafraîchit MarketAnalysis depuis PostgreSQL."""
     global market_analysis
     try:
+        from collections import Counter
         from database import get_pool
         pool = await get_pool()
         async with pool.acquire() as conn:
@@ -101,6 +103,7 @@ async def _refresh_market_analysis():
                 "FROM jobs ORDER BY created_at DESC LIMIT 5000"
             )
         jobs_list = []
+        requirement_counts: Counter = Counter()
         for r in rows:
             jobs_list.append({
                 "title":       r["title"] or "",
@@ -113,7 +116,12 @@ async def _refresh_market_analysis():
                 "company":  r["industry"] or "",
                 "salary":   r["salary"] or "",
             })
-        market_analysis    = MarketAnalysis(jobs_list)
+            # Count skills from job requirements (must_have) so job-card gaps appear in Skills Gap tab
+            for part in (r["must_have"] or "").split(","):
+                s = part.strip()
+                if s:
+                    requirement_counts[s] += 1
+        market_analysis    = MarketAnalysis(jobs_list, requirement_counts)
         _jr.market_analysis = market_analysis
         logger.info(f"[market] Refreshed — {market_analysis.total} jobs ✓")
     except Exception as e:
@@ -133,6 +141,13 @@ class ProfileIn(BaseModel):
     open_to_remote:      bool      = True
     salary_expectation:  str       = ""
     user_id:             str       = ""
+
+    @field_validator("user_id", mode="before")
+    @classmethod
+    def user_id_to_str(cls, v):
+        if v is None: return ""
+        if isinstance(v, (int, float)): return str(int(v))
+        return str(v) if v else ""
 
 
 class ProfileRequest(BaseModel):
@@ -347,7 +362,7 @@ def api_status():
 
 
 @app.get("/api/market")
-def api_market():
+async def api_market(user_id: str | None = None):
     top_skills    = [{"skill": s, "count": c} for s, c in market_analysis.skill_counts.most_common(30)]
     top_locations = [{"location": l, "count": c} for l, c in market_analysis.locations.most_common(15)]
     top_companies = [{"company": co, "count": c} for co, c in market_analysis.companies.most_common(15)]
@@ -358,33 +373,214 @@ def api_market():
                 "count": len(vals), "min": round(min(vals)),
                 "median": round(statistics.median(vals)), "max": round(max(vals)),
             }
-    return {
+    out = {
         "total_jobs": market_analysis.total,
         "sources":    dict(market_analysis.sources.most_common()),
         "remote_ratio": round(market_analysis.remote_ratio, 3),
         "top_skills": top_skills, "top_locations": top_locations,
         "top_companies": top_companies, "salaries": salaries,
     }
+    # User-specific: avg AI match score and score breakdown (Excellent / Good / etc.)
+    if user_id and user_id.strip():
+        try:
+            uid = int(user_id.strip())
+            jobs = await get_jobs_for_user(uid)
+            scores = []
+            for j in jobs:
+                s = j.get("match_score")
+                if isinstance(s, (int, float)) and s >= 0:
+                    scores.append(float(s))
+            if scores:
+                out["avg_ai_score"] = round(statistics.mean(scores) * 100, 1)
+                out["score_breakdown"] = {
+                    "excellent": sum(1 for s in scores if s >= 0.75),
+                    "good":      sum(1 for s in scores if 0.55 <= s < 0.75),
+                    "moderate":  sum(1 for s in scores if 0.40 <= s < 0.55),
+                    "low":       sum(1 for s in scores if s < 0.40),
+                }
+            else:
+                out["avg_ai_score"] = None
+                out["score_breakdown"] = {"excellent": 0, "good": 0, "moderate": 0, "low": 0}
+        except (ValueError, Exception):
+            out["avg_ai_score"] = None
+            out["score_breakdown"] = {"excellent": 0, "good": 0, "moderate": 0, "low": 0}
+    return out
 
 
 # ═══════════════════════════════════════════════════════════════════════════════
 #  Routes — Report
 # ═══════════════════════════════════════════════════════════════════════════════
 
+async def _user_jobs_to_market_analysis(user_id: int) -> MarketAnalysis:
+    """Build a MarketAnalysis from the jobs saved in this user's list (personalized)."""
+    from collections import Counter
+    jobs_raw = await get_jobs_for_user(user_id)
+    jobs_list = []
+    requirement_counts = Counter()
+    for j in jobs_raw:
+        desc_parts = [
+            j.get("description") or "",
+            j.get("skills_req") or "",
+            j.get("skills_bon") or "",
+            j.get("tags") or "",
+        ]
+        if isinstance(desc_parts[-1], list):
+            desc_parts[-1] = " ".join(desc_parts[-1])
+        tags_raw = j.get("tags") or ""
+        tags_list = tags_raw if isinstance(tags_raw, list) else [t.strip() for t in str(tags_raw).split(",") if t.strip()]
+        jobs_list.append({
+            "title":       j.get("title") or "",
+            "description": " ".join(filter(None, desc_parts)),
+            "tags":        tags_list,
+            "source":      j.get("source") or "unknown",
+            "location":    j.get("location") or "",
+            "company":     j.get("industry") or "",
+            "industry":    j.get("industry") or "",
+            "salary":      j.get("salary") or "",
+            "url":         j.get("url") or "",
+            "skills_req":  j.get("skills_req") or "",
+            "must_have":   j.get("skills_req") or "",
+            "skills_bon":  j.get("skills_bon") or "",
+            "nice_to_have": j.get("skills_bon") or "",
+        })
+        for part in (j.get("skills_req") or "").split(","):
+            s = part.strip()
+            if s:
+                requirement_counts[s] += 1
+    return MarketAnalysis(jobs_list, requirement_counts)
+
+
+def _sanitize_display_company(s: str) -> str:
+    """Use for report/PDF: avoid showing salary or long text as company name."""
+    if not s or not isinstance(s, str):
+        return "—"
+    s = s.strip()
+    if not s:
+        return "—"
+    if s.lower().startswith("salary") or "$" in s or "€" in s:
+        return "—"
+    if len(s) > 60:
+        return "—"
+    return s
+
+
+def _sanitize_display_location(s: str) -> str:
+    """Avoid showing salary or description as location."""
+    if not s or not isinstance(s, str):
+        return "—"
+    s = s.strip()
+    if "$" in s or "€" in s or s.lower().startswith("salary") or "years" in s.lower():
+        return "—"
+    if len(s) > 80:
+        return s[:77] + "…"
+    return s
+
+
+async def _user_report_matches(user_id: int, prof: CandidateProfile, top_n: int = 20) -> list:
+    """
+    Build report matches from the user's job list using stored DB scores
+    so the report matches what the user sees in the Matches tab.
+    The Matches tab displays match_score (AI BiEncoder), not combined_score,
+    so we use match_score for the percentage and for sorting.
+    Sanitizes company/location so we don't show salary or garbage as company name.
+    """
+    jobs_raw = await get_jobs_for_user(user_id)
+    prof_skills_lower = prof.skills_set()
+    out = []
+    for j in jobs_raw:
+        # Use match_score (biencoder) like the Matches tab; fallback to combined_score
+        raw_score = j.get("match_score")
+        if raw_score is None or raw_score < 0:
+            raw_score = j.get("combined_score")
+        if raw_score is not None and raw_score >= 0:
+            total = round(float(raw_score) * 100)
+        else:
+            total = 0
+        if total >= 75:
+            verdict = "Strong match"
+        elif total >= 55:
+            verdict = "Good"
+        elif total >= 40:
+            verdict = "Worth applying"
+        elif total >= 25:
+            verdict = "Moderate"
+        else:
+            verdict = "Low match"
+        skills_req_str = j.get("skills_req") or ""
+        req_skills = [s.strip() for s in skills_req_str.split(",") if s.strip()]
+        matched = [s for s in req_skills if s.lower() in prof_skills_lower]
+        missing = list(j.get("gap_missing") or [])
+        company = _sanitize_display_company(j.get("industry") or "")
+        location = _sanitize_display_location(j.get("location") or "")
+        salary = (j.get("salary") or "").strip()
+        if salary and ("$" in salary or "€" in salary) and len(salary) > 50:
+            salary = salary[:47] + "…"
+        job_display = {
+            "title":       j.get("title") or "",
+            "company":     company,
+            "industry":    company,
+            "location":    location,
+            "salary":      salary or "Not specified",
+            "url":         j.get("url") or "",
+            "experience":  j.get("experience") or "",
+            "contract":   j.get("contract") or "",
+            "remote":     j.get("remote") or "",
+        }
+        out.append({
+            "job":     job_display,
+            "total":   total,
+            "verdict": verdict,
+            "matched": matched,
+            "missing": missing,
+        })
+    out.sort(key=lambda x: x["total"], reverse=True)
+    return out[:top_n]
+
+
+async def _report_profile(data: ProfileIn):
+    """Load profile from DB when only user_id is sent (like gap/roadmap)."""
+    if data.user_id and not data.skills:
+        try:
+            user = await get_user(int(data.user_id))
+            if user:
+                raw = user.get("skills") or ""
+                data.skills = [s.strip() for s in raw.split(",") if s.strip()]
+                if not data.target_role:
+                    data.target_role = user.get("role") or ""
+                name = " ".join(filter(None, [user.get("first_name"), user.get("last_name")])).strip()
+                if not data.name and name:
+                    data.name = name
+        except Exception:
+            pass
+    return _to_candidate_profile(data)
+
+
 @app.post("/api/report")
-def api_report(data: ProfileIn):
-    prof = _to_candidate_profile(data)
-    gap  = compute_gap(market_analysis, prof.skills_set())
-    ms   = match_jobs(market_analysis, prof, top_n=20)
+async def api_report(data: ProfileIn):
+    prof = await _report_profile(data)
+    if not prof.skills:
+        raise HTTPException(400, "No skills provided. Run a CV scan first.")
+    if data.user_id and data.user_id.strip():
+        try:
+            uid = int(data.user_id.strip())
+            analysis = await _user_jobs_to_market_analysis(uid)
+            ms = await _user_report_matches(uid, prof, top_n=20)
+        except (ValueError, Exception):
+            analysis = market_analysis
+            ms = match_jobs(analysis, prof, top_n=20)
+    else:
+        analysis = market_analysis
+        ms = match_jobs(analysis, prof, top_n=20)
+    gap  = compute_gap(analysis, prof.skills_set())
     rm   = generate_roadmap(gap, prof)
-    md   = generate_report(market_analysis, prof, gap, ms, rm)
-    return {"markdown": md}
+    md   = generate_report(analysis, prof, gap, ms, rm)
+    return {"report": md, "markdown": md}
 
 
 @app.post("/api/report/pdf")
-def api_report_pdf(data: ProfileIn):
+async def api_report_pdf(data: ProfileIn):
     from reportlab.lib import colors
-    from reportlab.lib.enums import TA_CENTER
+    from reportlab.lib.enums import TA_CENTER, TA_LEFT
     from reportlab.lib.pagesizes import A4
     from reportlab.lib.styles import ParagraphStyle, getSampleStyleSheet
     from reportlab.lib.units import cm, mm
@@ -392,101 +588,194 @@ def api_report_pdf(data: ProfileIn):
         HRFlowable, PageBreak, SimpleDocTemplate,
         Spacer, Table, TableStyle, Paragraph,
     )
-    prof    = _to_candidate_profile(data)
-    gap     = compute_gap(market_analysis, prof.skills_set())
-    matches = match_jobs(market_analysis, prof, top_n=20)
+    prof = await _report_profile(data)
+    if not prof.skills:
+        raise HTTPException(400, "No skills provided. Run a CV scan first.")
+    if data.user_id and data.user_id.strip():
+        try:
+            uid = int(data.user_id.strip())
+            analysis = await _user_jobs_to_market_analysis(uid)
+            matches = await _user_report_matches(uid, prof, top_n=20)
+        except (ValueError, Exception):
+            analysis = market_analysis
+            matches = match_jobs(analysis, prof, top_n=20)
+    else:
+        analysis = market_analysis
+        matches = match_jobs(analysis, prof, top_n=20)
+    gap = compute_gap(analysis, prof.skills_set())
+    user_skills_lower = {s.lower() for s in prof.skills}
+    miss = gap["missing"][:15]
+    miss = order_missing_skills_by_prerequisites(miss, user_skills_lower)
+    phases = {"beginner": [], "intermediate": [], "advanced": []}
+    for skill, count in miss:
+        meta = LEARNING_META.get(skill, {})
+        d = meta.get("d", "Intermediate").lower()
+        tip = sanitize_learning_tip(meta.get("tip", "Official docs + projects"))
+        entry = {"skill": skill, "weeks": meta.get("w", 4), "tip": tip, "impact": round(count / analysis.total * 100, 1) if analysis.total else 0}
+        phases.get(d, phases["intermediate"]).append(entry)
+
     buf = io.BytesIO()
     doc = SimpleDocTemplate(buf, pagesize=A4,
-        leftMargin=2*cm, rightMargin=2*cm, topMargin=2*cm, bottomMargin=2*cm,
-        title=f"Career Report – {prof.name}",
+        leftMargin=1.8*cm, rightMargin=1.8*cm, topMargin=1.5*cm, bottomMargin=1.5*cm,
+        title=f"Career Report – {prof.name or 'Candidate'}",
     )
-    BRAND = colors.HexColor("#7b61ff")
-    GRAY  = colors.HexColor("#888888")
-    WHITE = colors.white
-    styles   = getSampleStyleSheet()
-    s_title  = ParagraphStyle("T",  parent=styles["Title"],   fontSize=22, textColor=BRAND, spaceAfter=6,  fontName="Helvetica-Bold")
-    s_sub    = ParagraphStyle("S",  parent=styles["Normal"],  fontSize=10, textColor=GRAY,  spaceAfter=14)
-    s_h2     = ParagraphStyle("H2", parent=styles["Heading2"],fontSize=14, textColor=BRAND, spaceBefore=16, spaceAfter=8, fontName="Helvetica-Bold")
-    s_body   = ParagraphStyle("B",  parent=styles["Normal"],  fontSize=10, spaceAfter=4,   leading=14)
-    s_small  = ParagraphStyle("Sm", parent=styles["Normal"],  fontSize=9,  textColor=GRAY, spaceAfter=2,   leading=12)
-    s_center = ParagraphStyle("Ctr",parent=styles["Normal"],  fontSize=10, alignment=TA_CENTER, textColor=GRAY, spaceAfter=2)
-    story = []
-    story.append(Spacer(1, 2*cm))
+    BRAND   = colors.HexColor("#7b61ff")
+    GRAY    = colors.HexColor("#6b7280")
+    DARK    = colors.HexColor("#1f2937")
+    WHITE   = colors.white
+    GREEN   = colors.HexColor("#10b981")
+    AMBER   = colors.HexColor("#f59e0b")
+    RED     = colors.HexColor("#ef4444")
+    BG_LIGHT= colors.HexColor("#f8fafc")
+    styles  = getSampleStyleSheet()
+    s_title = ParagraphStyle("T", parent=styles["Title"], fontSize=24, textColor=BRAND, spaceAfter=4, fontName="Helvetica-Bold", alignment=TA_CENTER)
+    s_sub   = ParagraphStyle("S", parent=styles["Normal"], fontSize=10, textColor=GRAY, spaceAfter=16, alignment=TA_CENTER)
+    s_h2    = ParagraphStyle("H2", parent=styles["Heading2"], fontSize=13, textColor=BRAND, spaceBefore=14, spaceAfter=6, fontName="Helvetica-Bold")
+    s_h3    = ParagraphStyle("H3", parent=styles["Normal"], fontSize=11, textColor=DARK, spaceBefore=10, spaceAfter=4, fontName="Helvetica-Bold")
+    s_body  = ParagraphStyle("B", parent=styles["Normal"], fontSize=9, spaceAfter=3, leading=12)
+    s_small = ParagraphStyle("Sm", parent=styles["Normal"], fontSize=8, textColor=GRAY, spaceAfter=2, leading=10)
+    s_center= ParagraphStyle("Ctr", parent=styles["Normal"], fontSize=9, alignment=TA_CENTER, textColor=GRAY, spaceAfter=2)
+    story   = []
+
+    # Cover / header
+    story.append(Spacer(1, 1.2*cm))
     story.append(Paragraph("Career Analysis Report", s_title))
-    story.append(Paragraph(f"Prepared for <b>{prof.name}</b> | {datetime.now().strftime('%B %d, %Y')}", s_sub))
-    story.append(HRFlowable(width="100%", thickness=2, color=BRAND, spaceAfter=10))
+    story.append(Paragraph(f"Prepared for <b>{prof.name or 'Candidate'}</b>", s_sub))
+    story.append(Paragraph(datetime.now().strftime("%B %d, %Y"), s_center))
+    story.append(HRFlowable(width="100%", thickness=2, color=BRAND, spaceAfter=12))
     story.append(Paragraph("1. Your Profile", s_h2))
+    skills_val = ", ".join(prof.skills[:20]) or "—"
+    if len(prof.skills) > 20:
+        skills_val += " …"
+    # Use Paragraph so skills wrap inside the table cell (no truncation)
+    skills_cell = Paragraph(skills_val.replace("&", "&amp;").replace("<", "&lt;").replace(">", "&gt;"), s_body)
     t = Table([
-        ["Name", prof.name], ["Target Role", prof.target_role],
+        ["Name", prof.name or "—"], ["Target role", prof.target_role or "—"],
         ["Experience", f"{prof.experience_years} years"],
-        ["Skills", ", ".join(prof.skills) or "—"],
-        ["Open to Remote", "Yes" if prof.open_to_remote else "No"],
-        ["Salary Expectation", prof.salary_expectation or "Not specified"],
+        ["Skills", skills_cell],
+        ["Open to remote", "Yes" if prof.open_to_remote else "No"],
+        ["Salary expectation", prof.salary_expectation or "Not specified"],
     ], colWidths=[4*cm, 12*cm])
     t.setStyle(TableStyle([
-        ("BACKGROUND",(0,0),(0,-1),colors.HexColor("#f3f0ff")),
-        ("TEXTCOLOR",(0,0),(0,-1),BRAND),("FONTNAME",(0,0),(0,-1),"Helvetica-Bold"),
-        ("FONTSIZE",(0,0),(-1,-1),10),("GRID",(0,0),(-1,-1),0.5,colors.HexColor("#e0daf5")),
-        ("LEFTPADDING",(0,0),(-1,-1),8),("TOPPADDING",(0,0),(-1,-1),6),
+        ("BACKGROUND",(0,0),(0,-1), colors.HexColor("#f3f0ff")),
+        ("TEXTCOLOR",(0,0),(0,-1), BRAND), ("FONTNAME",(0,0),(0,-1), "Helvetica-Bold"),
+        ("FONTSIZE",(0,0),(-1,-1), 9), ("GRID",(0,0),(-1,-1), 0.4, colors.HexColor("#e5e7eb")),
+        ("LEFTPADDING",(0,0),(-1,-1), 8), ("TOPPADDING",(0,0),(-1,-1), 5), ("BOTTOMPADDING",(0,0),(-1,-1), 5),
     ]))
     story.append(t)
+
+    # 2. Market overview + insights
     story.append(Paragraph("2. Market Overview", s_h2))
     ov = [[
-        Paragraph(f"<b>{market_analysis.total}</b><br/><font size=8>Total Jobs</font>", s_center),
-        Paragraph(f"<b>{len(market_analysis.sources)}</b><br/><font size=8>Sources</font>", s_center),
-        Paragraph(f"<b>{market_analysis.remote_ratio:.0%}</b><br/><font size=8>Remote</font>", s_center),
+        Paragraph(f"<b>{analysis.total}</b><br/><font size=7>Total jobs</font>", s_center),
+        Paragraph(f"<b>{len(analysis.sources)}</b><br/><font size=7>Sources</font>", s_center),
+        Paragraph(f"<b>{analysis.remote_ratio:.0%}</b><br/><font size=7>Remote-friendly</font>", s_center),
     ]]
-    t = Table(ov, colWidths=[5.5*cm,5.5*cm,5.5*cm])
+    t = Table(ov, colWidths=[5*cm, 5*cm, 5*cm])
     t.setStyle(TableStyle([
-        ("ALIGN",(0,0),(-1,-1),"CENTER"),("VALIGN",(0,0),(-1,-1),"MIDDLE"),
-        ("BOX",(0,0),(-1,-1),1,BRAND),("TOPPADDING",(0,0),(-1,-1),10),("BOTTOMPADDING",(0,0),(-1,-1),10),
+        ("ALIGN",(0,0),(-1,-1),"CENTER"), ("VALIGN",(0,0),(-1,-1),"MIDDLE"),
+        ("BOX",(0,0),(-1,-1), 1, BRAND), ("TOPPADDING",(0,0),(-1,-1), 10), ("BOTTOMPADDING",(0,0),(-1,-1), 10),
     ]))
-    story.append(t); story.append(Spacer(1, 5*mm))
-    story.append(Paragraph("3. Your Competitiveness", s_h2))
-    cov   = gap["coverage"]
-    level = "Strong Candidate" if cov >= 0.5 else ("Competitive" if cov >= 0.25 else "Building Profile")
+    story.append(t)
+    story.append(Spacer(1, 4*mm))
+    story.append(Paragraph("Top skills in demand", s_h3))
+    top_skills = analysis.skill_counts.most_common(12)
+    t = Table([["Skill", "Jobs"]] + [[s, str(c)] for s, c in top_skills], colWidths=[10*cm, 5*cm])
+    t.setStyle(TableStyle([
+        ("BACKGROUND",(0,0),(-1,0), BG_LIGHT), ("FONTNAME",(0,0),(-1,0),"Helvetica-Bold"),
+        ("FONTSIZE",(0,0),(-1,-1), 8), ("GRID",(0,0),(-1,-1), 0.3, GRAY),
+        ("LEFTPADDING",(0,0),(-1,-1), 6), ("TOPPADDING",(0,0),(-1,-1), 3), ("BOTTOMPADDING",(0,0),(-1,-1), 3),
+    ]))
+    story.append(t)
+    story.append(Spacer(1, 3*mm))
+    story.append(Paragraph("Top companies hiring", s_h3))
+    top_co = list(analysis.companies.most_common(10))
+    t = Table([["Company", "Jobs"]] + [[c, str(n)] for c, n in top_co], colWidths=[10*cm, 5*cm]) if top_co else Table([["—", "—"]], colWidths=[10*cm, 5*cm])
+    t.setStyle(TableStyle([
+        ("BACKGROUND",(0,0),(-1,0), BG_LIGHT), ("FONTNAME",(0,0),(-1,0),"Helvetica-Bold"),
+        ("FONTSIZE",(0,0),(-1,-1), 8), ("GRID",(0,0),(-1,-1), 0.3, GRAY),
+        ("LEFTPADDING",(0,0),(-1,-1), 6), ("TOPPADDING",(0,0),(-1,-1), 3), ("BOTTOMPADDING",(0,0),(-1,-1), 3),
+    ]))
+    story.append(t)
+    story.append(Spacer(1, 3*mm))
+    story.append(Paragraph("Top locations", s_h3))
+    top_loc = list(analysis.locations.most_common(8))
+    t = Table([["Location", "Jobs"]] + [[loc, str(n)] for loc, n in top_loc], colWidths=[10*cm, 5*cm]) if top_loc else Table([["—", "—"]], colWidths=[10*cm, 5*cm])
+    t.setStyle(TableStyle([
+        ("BACKGROUND",(0,0),(-1,0), BG_LIGHT), ("FONTNAME",(0,0),(-1,0),"Helvetica-Bold"),
+        ("FONTSIZE",(0,0),(-1,-1), 8), ("GRID",(0,0),(-1,-1), 0.3, GRAY),
+        ("LEFTPADDING",(0,0),(-1,-1), 6), ("TOPPADDING",(0,0),(-1,-1), 3), ("BOTTOMPADDING",(0,0),(-1,-1), 3),
+    ]))
+    story.append(t)
+
+    # 3. Skills gap
+    story.append(PageBreak())
+    story.append(Paragraph("3. Your Skills Gap", s_h2))
+    cov = gap["coverage"]
+    level = "Strong candidate" if cov >= 0.5 else ("Competitive" if cov >= 0.25 else "Building profile")
     story.append(Paragraph(
-        f"Coverage: <b>{cov:.0%}</b> | Matched: <b>{len(gap['matched'])} / {gap['total_market_skills']}</b> | Level: <b>{level}</b>", s_body))
+        f"Market coverage: <b>{cov:.0%}</b> · Matched skills: <b>{len(gap['matched'])}</b> / <b>{gap['total_market_skills']}</b> · <b>{level}</b>", s_body))
     story.append(Spacer(1, 4*mm))
     if gap["missing"]:
         t = Table(
-            [["#","Missing Skill","Jobs Requiring It"]] +
-            [[str(i),s,str(c)] for i,(s,c) in enumerate(gap["missing"][:20],1)],
-            colWidths=[1.5*cm,9*cm,6*cm]
-        )
+            [["#", "Missing skill", "Jobs", "Impact"]] +
+            [[str(i), s, str(c), f"{round(c/analysis.total*100,1)}%" if analysis.total else "—"]
+             for i, (s, c) in enumerate(gap["missing"][:15], 1)],
+            colWidths=[1.2*cm, 8*cm, 3*cm, 3*cm])
         t.setStyle(TableStyle([
-            ("BACKGROUND",(0,0),(-1,0),colors.HexColor("#ef4444")),
-            ("TEXTCOLOR",(0,0),(-1,0),WHITE),("FONTNAME",(0,0),(-1,0),"Helvetica-Bold"),
-            ("FONTSIZE",(0,0),(-1,-1),9),
-            ("ROWBACKGROUNDS",(0,1),(-1,-1),[WHITE,colors.HexColor("#fef2f2")]),
-            ("GRID",(0,0),(-1,-1),0.4,colors.HexColor("#ddd")),
-            ("LEFTPADDING",(0,0),(-1,-1),8),("TOPPADDING",(0,0),(-1,-1),4),
+            ("BACKGROUND",(0,0),(-1,0), BRAND), ("TEXTCOLOR",(0,0),(-1,0), WHITE), ("FONTNAME",(0,0),(-1,0),"Helvetica-Bold"),
+            ("FONTSIZE",(0,0),(-1,-1), 8),
+            ("ROWBACKGROUNDS",(0,1),(-1,-1), [WHITE, colors.HexColor("#fef2f2")]),
+            ("GRID",(0,0),(-1,-1), 0.3, GRAY),
+            ("LEFTPADDING",(0,0),(-1,-1), 6), ("TOPPADDING",(0,0),(-1,-1), 4), ("BOTTOMPADDING",(0,0),(-1,-1), 4),
         ]))
         story.append(t)
+
+    # 4. Learning roadmap
+    story.append(Paragraph("4. Learning Roadmap", s_h2))
+    total_weeks = sum(e["weeks"] for phase_list in phases.values() for e in phase_list)
+    story.append(Paragraph(f"Estimated total: <b>~{total_weeks} weeks</b> (skills can be learned in parallel).", s_body))
+    story.append(Spacer(1, 3*mm))
+    for phase_name, phase_list in [("Beginner — foundations", phases["beginner"]), ("Intermediate — core skills", phases["intermediate"]), ("Advanced — specialization", phases["advanced"])]:
+        if not phase_list:
+            continue
+        story.append(Paragraph(phase_name, s_h3))
+        for e in phase_list:
+            story.append(Paragraph(
+                f"<b>{e['skill']}</b> · ~{e['weeks']}w · {e['impact']}% of jobs", s_small))
+            story.append(Paragraph(f"Tip: {e['tip'][:120]}{'…' if len(e['tip'])>120 else ''}", s_small))
+        story.append(Spacer(1, 2*mm))
     story.append(PageBreak())
-    story.append(Paragraph("4. Best Job Matches", s_h2))
+    story.append(Paragraph("5. Best Job Matches", s_h2))
     for rank, match in enumerate(matches[:15], 1):
-        j   = match["job"]
-        clr = "#00e5a0" if match["total"] >= 70 else ("#eab308" if match["total"] >= 40 else "#ef4444")
+        j = match["job"]
+        company = _sanitize_display_company(j.get("industry") or j.get("company") or "") or "N/A"
+        location = _sanitize_display_location(j.get("location") or "") or "N/A"
+        salary_display = (j.get("salary") or "").strip()
+        if salary_display and len(salary_display) > 50:
+            salary_display = salary_display[:47] + "…"
+        if not salary_display:
+            salary_display = "—"
+        clr = "#10b981" if match["total"] >= 55 else ("#f59e0b" if match["total"] >= 40 else "#ef4444")
         story.append(Paragraph(
             f"<font color='{clr}'><b>[{rank}]</b></font> <b>{j.get('title','N/A')}</b> — "
             f"<font color='{clr}'>{match['total']}% ({match['verdict']})</font>", s_body))
         story.append(Paragraph(
-            f"<font color='#888'>Company:</font> {j.get('company','N/A')} | "
-            f"<font color='#888'>Location:</font> {j.get('location','') or 'N/A'} | "
-            f"<font color='#888'>Salary:</font> {j.get('salary','') or 'N/A'}", s_small))
+            f"<font color='#6b7280'>Company:</font> {company} · "
+            f"<font color='#6b7280'>Location:</font> {location} · "
+            f"<font color='#6b7280'>Salary:</font> {salary_display}", s_small))
         if match["matched"]:
-            story.append(Paragraph(f"<font color='#00e5a0'>✓ Matching:</font> {', '.join(match['matched'][:10])}", s_small))
+            story.append(Paragraph(f"✓ Matching: {', '.join(match['matched'][:8])}", s_small))
         if match["missing"]:
-            story.append(Paragraph(f"<font color='#ef4444'>✗ To learn:</font> {', '.join(match['missing'][:8])}", s_small))
+            story.append(Paragraph(f"✗ To learn: {', '.join(match['missing'][:6])}", s_small))
         story.append(Spacer(1, 3*mm))
-    story.append(Spacer(1, 1*cm))
-    story.append(HRFlowable(width="100%", thickness=1, color=GRAY, spaceAfter=6))
+    story.append(Spacer(1, 8*mm))
+    story.append(HRFlowable(width="100%", thickness=1, color=GRAY, spaceAfter=4))
     story.append(Paragraph(
-        f"<font color='#888' size=8>JobScan Career Report · "
-        f"Generated {datetime.now().strftime('%Y-%m-%d %H:%M')} · "
-        f"{market_analysis.total} jobs from {len(market_analysis.sources)} sources</font>", s_center))
+        f"<font color='#6b7280' size=7>JobScan Career Report · Generated {datetime.now().strftime('%Y-%m-%d %H:%M')} · "
+        f"{analysis.total} jobs from {len(analysis.sources)} sources</font>", s_center))
     doc.build(story)
     buf.seek(0)
+    safe_name = (prof.name or "report").replace(" ", "_").replace("/", "-")[:50]
     return StreamingResponse(buf, media_type="application/pdf",
-        headers={"Content-Disposition": f"attachment; filename=career_report_{prof.name or 'report'}.pdf"})
+        headers={"Content-Disposition": f"attachment; filename=career_report_{safe_name}.pdf"})

@@ -19,6 +19,12 @@ import asyncpg
 from dotenv import load_dotenv
 from pathlib import Path
 
+# Optional: fallback XAI when job was saved without xai (e.g. before column existed)
+try:
+    from xai_explainer import _fallback_xai as _xai_fallback
+except Exception:
+    _xai_fallback = None
+
 load_dotenv(Path(__file__).parent / ".env")
 logger = logging.getLogger(__name__)
 
@@ -107,6 +113,9 @@ ALTER TABLE users ADD COLUMN IF NOT EXISTS last_name  TEXT;
 ALTER TABLE users ADD COLUMN IF NOT EXISTS email      TEXT;
 ALTER TABLE users ADD COLUMN IF NOT EXISTS linkedin   TEXT;
 
+-- Add xai column for explainable AI (LLM-as-judge output) if missing
+ALTER TABLE jobs ADD COLUMN IF NOT EXISTS xai JSONB;
+
 -- ── Table jobs ───────────────────────────────────────────────────────────────
 CREATE TABLE IF NOT EXISTS jobs (
     id_job           SERIAL PRIMARY KEY,
@@ -130,6 +139,7 @@ CREATE TABLE IF NOT EXISTS jobs (
     education        TEXT,
     remote           TEXT,
     skills_gap       TEXT,
+    xai              JSONB,
     created_at       TIMESTAMP DEFAULT NOW()
 );
 
@@ -349,6 +359,9 @@ async def insert_job(user_id: int, card: dict) -> bool:
     gap_missing = card.get("gap_missing", [])
     skills_gap  = _json.dumps(gap_missing, ensure_ascii=False)
 
+    xai_obj = card.get("xai")
+    xai_db  = _json.dumps(xai_obj, ensure_ascii=False) if xai_obj else None
+
     raw_match = card.get("match_score", -1)
     match_score_db: Optional[float] = None
     if raw_match is not None and raw_match >= 0:
@@ -367,13 +380,13 @@ async def insert_job(user_id: int, card: dict) -> bool:
             seniority, must_have, nice_to_have,
             description, responsibilities, requirements,
             salary, match_score, cosine_score, combined_score,
-            contract, education, remote, skills_gap
+            contract, education, remote, skills_gap, xai
         ) VALUES (
             $1,  $2,  $3,  $4,  $5,  $6,
             $7,  $8,  $9,
             $10, $11, $12,
             $13, $14, $15, $16,
-            $17, $18, $19, $20
+            $17, $18, $19, $20, $21::jsonb
         )
     """
     try:
@@ -400,6 +413,7 @@ async def insert_job(user_id: int, card: dict) -> bool:
                 card.get("education", ""),
                 card.get("remote", ""),
                 skills_gap,
+                xai_db,
             )
         logger.info(f"[db] ✅ Job inserted/updated — user={user_id} url={card.get('url','')[:60]}")
         return True
@@ -411,7 +425,7 @@ async def insert_job(user_id: int, card: dict) -> bool:
 async def get_jobs_for_user(user_id: int) -> list[dict]:
     """
     Retourne tous les jobs où user_id est dans id_user[].
-    Triés par combined_score DESC.
+    Triés par match_score DESC (AI Match) pour alignement avec l’onglet Matches.
 
     FIX 1 : $1::integer — cast explicite pour éviter type mismatch asyncpg
              avec les colonnes INTEGER[] sur Azure PostgreSQL.
@@ -424,7 +438,7 @@ async def get_jobs_for_user(user_id: int) -> list[dict]:
                 """
                 SELECT * FROM jobs
                 WHERE $1::integer = ANY(id_user)
-                ORDER BY combined_score DESC NULLS LAST
+                ORDER BY match_score DESC NULLS LAST
                 """,
                 user_id,
             )
@@ -450,6 +464,22 @@ async def get_jobs_for_user(user_id: int) -> list[dict]:
             else:
                 # Pas de skills requis connus → couverture complète si pas de gap
                 gap_coverage = 1.0 if missing_count == 0 else 0.5
+
+            # xai from DB; if missing (old jobs saved before xai column), use fallback so UI still shows formula + interpretation
+            xai_val = row.get("xai")
+            needs_xai_backfill = False
+            if xai_val is None and _xai_fallback is not None:
+                needs_xai_backfill = True
+                try:
+                    xai_val = _xai_fallback(
+                        float(cosine_raw or 0),
+                        float(match_raw if match_raw is not None else 0),
+                        float(combined_raw or 0),
+                        gap_coverage,
+                        total_skills,
+                    )
+                except Exception:
+                    pass
 
             result.append({
                 "id_job":         row["id_job"],
@@ -478,12 +508,34 @@ async def get_jobs_for_user(user_id: int) -> list[dict]:
                 "skills_bon":     row["nice_to_have"],
                 "tags":           row["requirements"],
                 "event":          "job",
+                "xai":            xai_val,
+                "_needs_xai_backfill": needs_xai_backfill,
             })
         logger.info(f"[db] get_jobs_for_user: {len(result)} jobs for user_id={user_id}")
         return result
     except Exception as e:
         logger.error(f"[db] get_jobs_for_user failed for user_id={user_id}: {e}")
         return []
+
+
+async def update_job_xai(id_job: int, xai_dict: dict) -> bool:
+    """Update the xai JSONB column for a job (e.g. after LLM backfill)."""
+    if not xai_dict:
+        return False
+    pool = await get_pool()
+    try:
+        json_str = _json.dumps(xai_dict, ensure_ascii=False)
+        async with pool.acquire() as conn:
+            await conn.execute(
+                "UPDATE jobs SET xai = $1::jsonb WHERE id_job = $2",
+                json_str,
+                id_job,
+            )
+        logger.debug("[db] update_job_xai OK — id_job=%s", id_job)
+        return True
+    except Exception as e:
+        logger.error(f"[db] update_job_xai failed id_job={id_job}: {e}")
+        return False
 
 
 async def user_has_jobs(user_id: int) -> bool:

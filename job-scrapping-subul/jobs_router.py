@@ -16,18 +16,20 @@ Importé dans main.py :
 import json
 import logging
 
-from fastapi import APIRouter, HTTPException
+from fastapi import APIRouter, BackgroundTasks, HTTPException
 from fastapi.responses import StreamingResponse
-from pydantic import BaseModel
+from pydantic import BaseModel, field_validator
 
-from database import get_jobs_for_user
+from database import get_jobs_for_user, get_user, update_job_xai
 from job_analyzer_agent import (
     CandidateProfile,
     MarketAnalysis,
     compute_gap,
+    order_missing_skills_by_prerequisites,
     match_jobs,
     generate_roadmap,
     LEARNING_META,
+    sanitize_learning_tip,
 )
 
 logger      = logging.getLogger(__name__)
@@ -53,6 +55,13 @@ class ProfileIn(BaseModel):
     open_to_remote:      bool      = True
     salary_expectation:  str       = ""
     user_id:             str       = ""
+
+    @field_validator("user_id", mode="before")
+    @classmethod
+    def user_id_to_str(cls, v):
+        if v is None: return ""
+        if isinstance(v, (int, float)): return str(int(v))
+        return str(v) if v else ""
 
 
 # ═══════════════════════════════════════════════════════════════════════════════
@@ -165,11 +174,65 @@ def _apply_filters(
 #  Routes FastAPI
 # ═══════════════════════════════════════════════════════════════════════════════
 
+async def _backfill_xai_for_user(user_id: int, jobs_needing_backfill: list[dict]) -> None:
+    """Background task: call LLM to fill xai for jobs that have none in DB, then update DB."""
+    if not jobs_needing_backfill:
+        return
+    try:
+        from xai_explainer import explain_job_match
+    except ImportError:
+        logger.warning("[backfill_xai] xai_explainer not available")
+        return
+    profile = await get_user(user_id)
+    if not profile:
+        logger.warning("[backfill_xai] No profile for user_id=%s", user_id)
+        return
+    cv_role = profile.get("role") or "Software Engineer"
+    cv_skills = (profile.get("skills") or "")[:500]
+    for job in jobs_needing_backfill:
+        try:
+            gap_missing = list(job.get("gap_missing") or [])
+            skills_req = job.get("skills_req") or ""
+            must_have_list = [s.strip() for s in skills_req.split(",") if s.strip()]
+            gap_matched = [s for s in must_have_list if s not in gap_missing]
+            match_raw = job.get("match_score")
+            match_val = float(match_raw) if match_raw is not None and match_raw >= 0 else 0.0
+            xai = await explain_job_match(
+                job_title=job.get("title") or "",
+                job_skills_req=skills_req,
+                gap_matched=gap_matched,
+                gap_missing=gap_missing,
+                gap_coverage=float(job.get("gap_coverage") or 1.0),
+                gap_total=int(job.get("gap_total") or 0),
+                cv_role=cv_role,
+                cv_skills_summary=cv_skills,
+                cosine=float(job.get("cosine") or job.get("cosine_score") or 0),
+                match_score=match_val,
+                combined_score=float(job.get("combined_score") or 0),
+            )
+            if xai and job.get("id_job"):
+                await update_job_xai(job["id_job"], xai)
+                logger.debug("[backfill_xai] Filled xai for job id=%s %s", job["id_job"], (job.get("title") or "")[:40])
+        except Exception as e:
+            logger.warning("[backfill_xai] Job id=%s: %s", job.get("id_job"), e)
+
+
+@jobs_router.get("/api/debug/roadmap-xai")
+def api_debug_roadmap_xai():
+    """Debug: is Azure/LLM configured for roadmap courses? (no auth, for local testing.)"""
+    try:
+        from xai_explainer import get_roadmap_xai_status
+        return get_roadmap_xai_status()
+    except Exception as e:
+        return {"error": str(e), "explainable_ai_enabled": False, "azure_client_ok": False}
+
+
 @jobs_router.get("/jobs/{user_id}")
-async def stream_cached_jobs(user_id: int):
+async def stream_cached_jobs(user_id: int, background_tasks: BackgroundTasks):
     """
     SSE stream des jobs depuis PostgreSQL pour un user_id.
     Utilisé par le dashboard pour afficher les jobs en cache.
+    Jobs sans xai en DB déclenchent un backfill en arrière-plan (LLM) pour la prochaine fois.
     """
     logger.info(f"[/jobs] GET /jobs/{user_id} — fetching from DB…")
 
@@ -177,6 +240,12 @@ async def stream_cached_jobs(user_id: int):
         uid  = int(user_id)
         jobs = await get_jobs_for_user(uid)
         logger.info(f"[/jobs] user_id={uid} → {len(jobs)} jobs")
+
+        # Jobs that had no xai in DB (we used fallback) → backfill in background so next load has LLM text
+        need_backfill = [j for j in jobs if j.pop("_needs_xai_backfill", False)]
+        if need_backfill:
+            background_tasks.add_task(_backfill_xai_for_user, uid, need_backfill)
+            logger.debug("[/jobs] Queued xai backfill for %s jobs", len(need_backfill))
 
         if not jobs:
             logger.warning(f"[/jobs] No jobs for user_id={uid}")
@@ -283,20 +352,47 @@ async def api_gap(data: ProfileIn):
     POST /api/gap
     Analyse le gap de compétences entre le profil utilisateur
     et les compétences demandées sur le marché.
+    Si seul user_id est envoyé, charge le profil depuis la DB.
     """
     if market_analysis is None:
         raise HTTPException(503, "MarketAnalysis not initialized")
 
+    # Load profile from DB when only user_id is provided and skills are missing
+    if data.user_id and not data.skills:
+        user = await get_user(int(data.user_id))
+        if user:
+            raw_skills = user.get("skills") or ""
+            if isinstance(raw_skills, str) and raw_skills.strip():
+                data.skills = [s.strip() for s in raw_skills.split(",") if s.strip()]
+            if not data.target_role and user.get("role"):
+                data.target_role = user.get("role") or ""
+
     prof = _to_candidate_profile(data)
     if not prof.skills:
-        raise HTTPException(400, "No skills provided")
+        raise HTTPException(400, "No skills provided. Run a CV scan first so we have your skills.")
 
     gap = compute_gap(market_analysis, prof.skills_set())
+    cv_skills_preview = ",".join(prof.skills[:30]) if prof.skills else None
+    total_jobs = market_analysis.total or 1
+    missing_enriched = []
+    for skill, count in gap["missing"][:25]:
+        meta = LEARNING_META.get(skill, {})
+        impact_pct = round(count / total_jobs * 100, 1) if total_jobs else 0
+        missing_enriched.append({
+            "skill":        skill,
+            "count":        count,
+            "difficulty":   meta.get("d", "Intermediate"),
+            "tip":          meta.get("tip", "Official docs + hands-on projects"),
+            "impact_pct":   impact_pct,
+        })
     return {
         "coverage":            gap["coverage"],
         "matched":             gap["matched"][:25],
         "missing":             gap["missing"][:25],
+        "missing_enriched":    missing_enriched,
         "total_market_skills": gap["total_market_skills"],
+        "total_jobs":           total_jobs,
+        "cv_skills":           cv_skills_preview,
     }
 
 
@@ -306,16 +402,34 @@ async def api_roadmap(data: ProfileIn, top_n: int = 15):
     POST /api/roadmap
     Génère une roadmap d'apprentissage personnalisée basée sur
     les compétences manquantes les plus demandées sur le marché.
+    Si seul user_id est envoyé, charge le profil depuis la DB.
     """
     if market_analysis is None:
         raise HTTPException(503, "MarketAnalysis not initialized")
 
+    if data.user_id and not data.skills:
+        user = await get_user(int(data.user_id))
+        if user:
+            raw_skills = user.get("skills") or ""
+            if isinstance(raw_skills, str) and raw_skills.strip():
+                data.skills = [s.strip() for s in raw_skills.split(",") if s.strip()]
+            if not data.target_role and user.get("role"):
+                data.target_role = user.get("role") or ""
+
     prof  = _to_candidate_profile(data)
+    if not prof.skills:
+        raise HTTPException(400, "No skills provided. Run a CV scan first so we have your skills.")
+
     gap   = compute_gap(market_analysis, prof.skills_set())
-    miss  = gap["missing"][:top_n]
     user_skills_lower = {s.lower() for s in prof.skills}
+    miss  = gap["missing"][:top_n]
+    # Intelligent order: prerequisites first, then market demand (e.g. Docker before Kubernetes)
+    miss  = order_missing_skills_by_prerequisites(miss, user_skills_lower)
+    cv_skills_summary = ", ".join(prof.skills[:25]) if prof.skills else ""
+    coverage_pct = gap["coverage"] * 100
 
     phases: dict[str, list] = {"beginner": [], "intermediate": [], "advanced": []}
+    skills_in_order: list[dict] = []
 
     for rank, (skill, count) in enumerate(miss, 1):
         meta    = LEARNING_META.get(skill, {})
@@ -323,6 +437,14 @@ async def api_roadmap(data: ProfileIn, top_n: int = 15):
         prereqs = meta.get("pre", [])
         prereqs_met     = [p for p in prereqs if p.lower() in user_skills_lower]
         prereqs_missing = [p for p in prereqs if p.lower() not in user_skills_lower]
+
+        impact = round(count / market_analysis.total * 100, 1) if market_analysis.total else 0
+        skills_in_order.append({
+            "skill": skill,
+            "difficulty": meta.get("d", "Intermediate"),
+            "jobs_count": count,
+            "impact_pct": impact,
+        })
 
         why_parts = [f"Ranked #{rank} because {count} job listings require this skill."]
         if d == "beginner":
@@ -337,7 +459,6 @@ async def api_roadmap(data: ProfileIn, top_n: int = 15):
             why_parts.append(f"You'll need to learn first: {', '.join(prereqs_missing)}.")
         if not prereqs:
             why_parts.append("No prerequisites — you can start immediately.")
-        impact = round(count / market_analysis.total * 100, 1) if market_analysis.total else 0
         why_parts.append(f"Learning this opens up {count} jobs ({impact}% of market).")
 
         entry = {
@@ -345,7 +466,8 @@ async def api_roadmap(data: ProfileIn, top_n: int = 15):
             "jobs_count":    count,
             "difficulty":    meta.get("d", "Intermediate"),
             "weeks":         meta.get("w", 4),
-            "tip":           meta.get("tip", "Official docs + projects"),
+            "tip":           sanitize_learning_tip(meta.get("tip", "Official docs + projects")),
+            "project_ideas": [],
             "prerequisites": prereqs,
             "xai": {
                 "rank":              rank,
@@ -358,8 +480,45 @@ async def api_roadmap(data: ProfileIn, top_n: int = 15):
         phases.get(d, phases["intermediate"]).append(entry)
 
     total_weeks = sum(LEARNING_META.get(s, {}).get("w", 4) for s, _ in miss)
-    return {
+    default_message = "Ordered by prerequisites first (learn foundations before building on them), then by market demand. Skills you can learn in parallel are grouped."
+
+    # Optional LLM enrichment: personalized message + per-skill courses (tip + project ideas, no external platforms)
+    debug_error: str | None = None
+    try:
+        from xai_explainer import enrich_roadmap_with_llm
+        llm_result = await enrich_roadmap_with_llm(
+            user_role=prof.target_role or "Software Engineer",
+            user_skills_summary=cv_skills_summary,
+            coverage_pct=coverage_pct,
+            skills_in_order=skills_in_order,
+        )
+        if llm_result:
+            default_message = llm_result.get("message") or default_message
+            courses_list = llm_result.get("courses") or []
+            course_by_skill = {c.get("skill", ""): c for c in courses_list if c.get("skill")}
+            applied = 0
+            for phase_list in phases.values():
+                for entry in phase_list:
+                    course = course_by_skill.get(entry["skill"])
+                    if course:
+                        entry["tip"] = course.get("tip") or entry["tip"]
+                        entry["project_ideas"] = course.get("project_ideas") or []
+                        if entry["project_ideas"]:
+                            applied += 1
+            logger.info("[roadmap] LLM courses applied: %s skills with project_ideas", applied)
+        else:
+            logger.info("[roadmap] LLM enrichment skipped or returned no data (check Azure config / EXPLAINABLE_AI_ENABLED)")
+    except Exception as e:
+        logger.warning("[roadmap] LLM enrichment failed: %s", e)
+        import traceback
+        debug_error = traceback.format_exc()
+
+    out = {
         "phases":      phases,
         "total_weeks": total_weeks,
         "coverage":    gap["coverage"],
+        "message":     default_message,
     }
+    if debug_error:
+        out["debug_error"] = debug_error
+    return out

@@ -3,7 +3,7 @@
 //  app/app/page.tsx  —  DASHBOARD
 // ─────────────────────────────────────────────────────────────────────────────
 
-import { useState, useEffect, useRef, Suspense, useCallback } from "react";
+import { useState, useEffect, useRef, Suspense, useCallback, useMemo } from "react";
 import { useVoice, type VoiceState } from "@/app/lib/useVoice";
 import { useRouter, useSearchParams } from "next/navigation";
 import {
@@ -26,6 +26,8 @@ interface Job {
   xai?: {
     cosine_score: number; match_score: number;
     explanations: string[]; score_formula: string; interpretation: string;
+    tip?: string;
+    strength?: string;
   };
 }
 
@@ -86,7 +88,7 @@ function scoreToInterp(score: number): string {
 
 function JobCard({ job }: { job: Job }) {
   const [expanded,   setExpanded]   = useState(false);
-  const [showXAI,    setShowXAI]    = useState(false);
+  const [showXAI,    setShowXAI]    = useState(!!(job.xai?.score_formula || job.xai?.interpretation));
   const [showAllGap, setShowAllGap] = useState(false);
 
   const score  = normalizeScore(job.match_score) || normalizeScore(job.cosine ?? job.cosine_score) || 0;
@@ -179,6 +181,9 @@ function JobCard({ job }: { job: Job }) {
               <span style={{ fontSize: 12, fontWeight: 700, color: C.text }}>Score Explanation</span>
               <span style={{ fontSize: 10, padding: "2px 8px", borderRadius: 4, background: b.bg, color: b.color, fontWeight: 700 }}>{b.label}</span>
             </div>
+            {job.xai?.score_formula && (
+              <div style={{ fontSize: 10, color: C.muted, fontFamily: MONO, marginBottom: 8, padding: "6px 8px", background: C.bg, borderRadius: 6 }}>📐 {job.xai.score_formula}</div>
+            )}
             {(() => {
               const cosP   = normalizeScore(job.xai?.cosine_score ?? job.cosine ?? job.cosine_score);
               const cosCol = scoreColor(cosP);
@@ -240,6 +245,18 @@ function JobCard({ job }: { job: Job }) {
             {job.xai?.explanations?.slice(1).map((e, i) => (
               <div key={i} style={{ fontSize: 10, color: C.muted, lineHeight: 1.5, padding: "4px 8px", background: C.bg, borderRadius: 6, marginTop: 4, fontFamily: MONO, fontStyle: "italic" }}>{e}</div>
             ))}
+            {job.xai?.tip && job.xai.tip.trim() && (
+              <div style={{ marginTop: 8, padding: "10px 12px", background: "linear-gradient(135deg, rgba(250,204,21,.12) 0%, rgba(250,204,21,.04) 100%)", borderRadius: 8, border: "1px solid rgba(250,204,21,.25)" }}>
+                <div style={{ fontSize: 9, fontWeight: 800, color: C.amber, textTransform: "uppercase", letterSpacing: "0.08em", marginBottom: 4 }}>💡 Tip for this role</div>
+                <div style={{ fontSize: 11, color: "#4a3f60", lineHeight: 1.5 }}>{job.xai.tip}</div>
+              </div>
+            )}
+            {job.xai?.strength && job.xai.strength.trim() && (
+              <div style={{ marginTop: 6, padding: "10px 12px", background: "linear-gradient(135deg, rgba(22,163,74,.08) 0%, rgba(22,163,74,.03) 100%)", borderRadius: 8, border: "1px solid rgba(22,163,74,.2)" }}>
+                <div style={{ fontSize: 9, fontWeight: 800, color: C.green, textTransform: "uppercase", letterSpacing: "0.08em", marginBottom: 4 }}>✓ Your strength to highlight</div>
+                <div style={{ fontSize: 11, color: "#4a3f60", lineHeight: 1.5 }}>{job.xai.strength}</div>
+              </div>
+            )}
           </div>
         )}
       </div>
@@ -738,8 +755,370 @@ function ChatSidebar({ userId, jobs = [] }: { userId: number; jobs?: Job[] }) {
     </div>
   );
 }
+
 // ─────────────────────────────────────────────────────────────────────────────
-//  MatchesTab
+//  GapTab — Skills Gap (separate interface after Matches)
+// ─────────────────────────────────────────────────────────────────────────────
+
+type GapDataNormalized = {
+  top_missing_skills: { skill: string; frequency: number }[];
+  top_matched_skills: { skill: string; frequency: number }[];
+  missing_enriched?: { skill: string; frequency: number; difficulty?: string; tip?: string; impact_pct?: number }[];
+  coverage: number;
+  total_market_skills: number;
+  total_jobs?: number;
+  cv_skills_preview?: string;
+};
+
+function normalizeGapResponse(api: any): GapDataNormalized | null {
+  if (!api || typeof api !== "object") return null;
+  const missing = api.missing || [];
+  const matched = api.matched || [];
+  const toPairs = (arr: any[]): { skill: string; frequency: number }[] =>
+    arr.map((item: any) =>
+      Array.isArray(item)
+        ? { skill: String(item[0] ?? ""), frequency: Number(item[1] ?? 0) }
+        : { skill: String(item?.skill ?? item), frequency: Number(item?.frequency ?? item?.count ?? 0) }
+    ).filter((d: { skill: string; frequency: number }) => d.skill);
+  const enriched = (api.missing_enriched || []).map((e: any) => ({
+    skill: String(e?.skill ?? ""),
+    frequency: Number(e?.count ?? e?.frequency ?? 0),
+    difficulty: e?.difficulty,
+    tip: e?.tip,
+    impact_pct: e?.impact_pct != null ? Number(e.impact_pct) : undefined,
+  })).filter((d: { skill: string }) => d.skill);
+  return {
+    top_missing_skills: enriched.length ? enriched.map((e: any) => ({ skill: e.skill, frequency: e.frequency })) : toPairs(api.top_missing_skills || missing).slice(0, 25),
+    top_matched_skills: toPairs(api.top_missing_skills ? [] : matched).slice(0, 25),
+    missing_enriched: enriched.length ? enriched : undefined,
+    coverage: Number(api.coverage) || 0,
+    total_market_skills: Number(api.total_market_skills) || 0,
+    total_jobs: api.total_jobs != null ? Number(api.total_jobs) : undefined,
+    cv_skills_preview: typeof api.cv_skills === "string" ? api.cv_skills : undefined,
+  };
+}
+
+function GapTab({
+  gapData,
+  gapLoad,
+  showLoadingPlaceholder,
+  onAnalyze,
+  onGoToRoadmap,
+  onRefresh,
+}: {
+  gapData: any;
+  gapLoad: boolean;
+  showLoadingPlaceholder?: boolean;
+  onAnalyze: () => void;
+  onGoToRoadmap?: () => void;
+  onRefresh?: () => void;
+}) {
+  const normalized = normalizeGapResponse(gapData);
+  const hasData = normalized && (normalized.top_missing_skills.length > 0 || normalized.top_matched_skills.length > 0 || normalized.total_market_skills > 0);
+  const showLoading = gapLoad || !!showLoadingPlaceholder;
+
+  return (
+    <div style={{ background: C.white, border: `1px solid ${C.border}`, borderRadius: 16, padding: "24px 28px", boxShadow: "0 2px 16px rgba(122,63,176,.06)" }}>
+      <div style={{ marginBottom: 20 }}>
+        <h2 style={{ fontSize: 18, fontWeight: 800, color: C.text, marginBottom: 4 }}>📊 Skills Gap</h2>
+        <p style={{ fontSize: 13, color: C.muted }}>Top missing skills across the market vs your profile. Use this to prioritize what to learn.</p>
+      </div>
+
+      {showLoading && (
+        <div style={{ textAlign: "center", padding: 48, color: C.muted }}>
+          <div style={{ display: "flex", justifyContent: "center", gap: 6, marginBottom: 12 }}>
+            {[0, 120, 240].map(d => <div key={d} style={{ width: 8, height: 8, borderRadius: "50%", background: C.p1, animation: `bounce 0.8s ${d}ms ease-in-out infinite` }} />)}
+          </div>
+          <div style={{ fontSize: 14, fontWeight: 600 }}>Analyzing skills gap…</div>
+        </div>
+      )}
+
+      {!showLoading && !hasData && (
+        <div style={{ textAlign: "center", padding: "48px 24px" }}>
+          <div style={{ fontSize: 42, marginBottom: 16 }}>📊</div>
+          <div style={{ fontSize: 16, fontWeight: 700, color: C.text, marginBottom: 8 }}>Top missing skills across the market</div>
+          <div style={{ fontSize: 13, color: C.muted, marginBottom: 24, maxWidth: 400, margin: "0 auto 24px" }}>
+            See which skills appear most in job listings but are missing from your profile. Run a scan first so we have your skills, then analyze.
+          </div>
+          <button style={S.btn} onClick={onAnalyze}>Analyze Skills Gap</button>
+          {gapData && typeof gapData?.detail === "string" && (
+            <div style={{ marginTop: 16, fontSize: 12, color: C.amber }}>{gapData.detail}</div>
+          )}
+        </div>
+      )}
+
+      {!showLoading && hasData && normalized && (
+        <div style={{ display: "flex", flexDirection: "column", gap: 20 }}>
+          <div style={{ display: "flex", gap: 12, flexWrap: "wrap", alignItems: "center", justifyContent: "space-between" }}>
+            <div style={{ display: "flex", gap: 12, flexWrap: "wrap", alignItems: "center" }}>
+              <div style={{ ...S.sec, flex: 1, minWidth: 140, marginBottom: 0, textAlign: "center" }}>
+                <div style={{ fontSize: 24, fontWeight: 800, color: C.p1 }}>{Math.round(normalized.coverage * 100)}%</div>
+                <div style={{ fontSize: 11, color: C.muted }}>Market coverage</div>
+              </div>
+              <div style={{ ...S.sec, flex: 1, minWidth: 140, marginBottom: 0, textAlign: "center" }}>
+                <div style={{ fontSize: 24, fontWeight: 800, color: C.text }}>{normalized.total_market_skills}</div>
+                <div style={{ fontSize: 11, color: C.muted }}>Skills in market</div>
+              </div>
+            </div>
+            <div style={{ display: "flex", gap: 8, flexWrap: "wrap" }}>
+              {onGoToRoadmap && (
+                <button style={S.btn} onClick={onGoToRoadmap}>🗺️ Build learning roadmap</button>
+              )}
+              {onRefresh && (
+                <button style={S.btnOut} onClick={onRefresh}>🔄 Refresh analysis</button>
+              )}
+            </div>
+          </div>
+
+          {normalized.missing_enriched && normalized.missing_enriched.length > 0 && (
+            <>
+              {(() => {
+                const top3 = normalized.missing_enriched.slice(0, 3);
+                const sumImpact = top3.reduce((s, e) => s + (e.impact_pct ?? 0), 0);
+                return sumImpact > 0 ? (
+                  <div style={{ ...S.sec, marginBottom: 0, background: "rgba(122,63,176,.06)", borderColor: "rgba(122,63,176,.2)" }}>
+                    <div style={{ fontSize: 12, color: C.text }}>💡 Learning the <strong>top 3</strong> missing skills could unlock <strong>~{Math.round(sumImpact)}%</strong> more jobs in the market.</div>
+                  </div>
+                ) : null;
+              })()}
+
+              <div style={S.sec}>
+                <div style={{ fontSize: 11, color: C.muted, marginBottom: 10, textTransform: "uppercase", letterSpacing: "0.05em" }}>Learn first (priority order)</div>
+                <div style={{ display: "flex", flexDirection: "column", gap: 10 }}>
+                  {normalized.missing_enriched.slice(0, 5).map((item, i) => {
+                    const diff = (item.difficulty || "").toLowerCase();
+                    const diffColor = diff === "beginner" ? C.green : diff === "advanced" ? C.amber : C.p2;
+                    return (
+                      <div key={item.skill} style={{ display: "flex", flexWrap: "wrap", gap: 8, alignItems: "flex-start", padding: "10px 12px", background: C.white, borderRadius: 8, border: `1px solid ${C.border}` }}>
+                        <span style={{ fontSize: 12, fontWeight: 700, color: C.text, minWidth: 24 }}>#{i + 1}</span>
+                        <span style={{ fontSize: 13, fontWeight: 700, color: C.text }}>{item.skill}</span>
+                        {item.impact_pct != null && item.impact_pct > 0 && (
+                          <span style={{ fontSize: 10, color: C.muted, fontFamily: MONO }}>{item.impact_pct}% of jobs</span>
+                        )}
+                        {item.difficulty && (
+                          <span style={{ fontSize: 9, padding: "2px 6px", borderRadius: 4, background: `${diffColor}22`, color: diffColor, border: `1px solid ${diffColor}44`, fontWeight: 600 }}>{item.difficulty}</span>
+                        )}
+                        {item.tip && (
+                          <div style={{ width: "100%", fontSize: 11, color: C.muted, marginTop: 4, paddingLeft: 32 }}>📚 {item.tip}</div>
+                        )}
+                      </div>
+                    );
+                  })}
+                </div>
+              </div>
+            </>
+          )}
+
+          <div>
+            <div style={{ fontSize: 14, fontWeight: 700, color: C.text, marginBottom: 12 }}>
+              Top {normalized.top_missing_skills.length} missing skills across the market
+            </div>
+            <VerticalChart
+              data={normalized.top_missing_skills}
+              title="Missing skills (learn these to open more jobs)"
+              valueKey="frequency"
+              labelKey="skill"
+              barColor={C.p0}
+              height={260}
+            />
+          </div>
+
+          {normalized.top_matched_skills.length > 0 && (
+            <div style={S.sec}>
+              <div style={{ fontSize: 11, color: C.muted, marginBottom: 8, textTransform: "uppercase", letterSpacing: "0.05em" }}>Your skills in demand</div>
+              <div style={{ display: "flex", flexWrap: "wrap", gap: 6 }}>
+                {normalized.top_matched_skills.map(({ skill, frequency }) => (
+                  <span key={skill} style={{ fontSize: 11, padding: "4px 10px", borderRadius: 6, background: "rgba(22,163,74,.08)", color: C.green, border: "1px solid rgba(22,163,74,.25)" }}>
+                    ✓ {skill} <span style={{ color: C.muted, fontWeight: 600 }}>({frequency})</span>
+                  </span>
+                ))}
+              </div>
+            </div>
+          )}
+
+          {normalized.cv_skills_preview && (
+            <div style={S.sec}>
+              <div style={{ fontSize: 11, color: C.muted, marginBottom: 8, textTransform: "uppercase", letterSpacing: "0.05em" }}>Your current skills</div>
+              <div style={{ display: "flex", flexWrap: "wrap", gap: 4 }}>
+                {normalized.cv_skills_preview.split(",").slice(0, 24).map((s: string) => s.trim()).filter(Boolean).map((s: string) => (
+                  <span key={s} style={{ fontSize: 10, padding: "2px 8px", borderRadius: 4, background: C.light, color: C.p2, border: `1px solid ${C.border}` }}>{s}</span>
+                ))}
+              </div>
+            </div>
+          )}
+        </div>
+      )}
+    </div>
+  );
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+//  RoadmapTab — Learning roadmap (phases: beginner → intermediate → advanced)
+// ─────────────────────────────────────────────────────────────────────────────
+
+type RoadmapPhaseItem = {
+  skill: string;
+  jobs_count: number;
+  difficulty: string;
+  weeks: number;
+  tip: string;
+  project_ideas?: string[];
+  prerequisites: string[];
+  xai?: { rank: number; reason: string; market_impact_pct?: number; prereqs_met?: string[]; prereqs_missing?: string[]; llm_insight?: string };
+};
+
+function RoadmapPhaseCard({ item }: { item: RoadmapPhaseItem }) {
+  const [expanded, setExpanded] = useState(false);
+  const diff = (item.difficulty || "").toLowerCase();
+  const diffColor = diff === "beginner" ? C.green : diff === "advanced" ? C.amber : C.p2;
+  const xai = item.xai;
+  return (
+    <div style={{ ...S.sec, display: "flex", flexDirection: "column", gap: 8 }}>
+      <div style={{ display: "flex", flexWrap: "wrap", gap: 8, alignItems: "center" }}>
+        <span style={{ fontWeight: 700, fontSize: 13, color: C.text }}>{item.skill}</span>
+        <span style={{ fontSize: 9, padding: "2px 7px", borderRadius: 4, background: `${diffColor}22`, color: diffColor, border: `1px solid ${diffColor}44` }}>{item.difficulty}</span>
+        <span style={{ fontSize: 10, color: C.muted, fontFamily: MONO }}>~{item.weeks}w</span>
+        {xai?.market_impact_pct != null && (
+          <span style={{ fontSize: 10, color: C.p2 }}>{xai.market_impact_pct}% of jobs</span>
+        )}
+      </div>
+      <div style={{ fontSize: 11, color: C.muted }}>📚 {item.tip}</div>
+      {item.project_ideas && item.project_ideas.length > 0 && (
+        <div style={{ fontSize: 11, color: C.p2, padding: "6px 8px", background: "rgba(122,63,176,.06)", borderRadius: 6, borderLeft: `3px solid ${C.p2}` }}>
+          <div style={{ fontWeight: 600, marginBottom: 4 }}>🛠️ Small project ideas</div>
+          <ul style={{ margin: 0, paddingLeft: 16 }}>
+            {item.project_ideas.map((idea, i) => (
+              <li key={i} style={{ marginBottom: 2 }}>{idea}</li>
+            ))}
+          </ul>
+        </div>
+      )}
+      {xai?.llm_insight && (
+        <div style={{ fontSize: 11, color: C.p2, fontStyle: "italic", padding: "6px 8px", background: "rgba(122,63,176,.06)", borderRadius: 6, borderLeft: `3px solid ${C.p2}` }}>
+          💡 {xai.llm_insight}
+        </div>
+      )}
+      {item.prerequisites && item.prerequisites.length > 0 && (
+        <div style={{ fontSize: 10, color: C.muted }}>
+          Prerequisites: {item.prerequisites.join(", ")}
+          {xai?.prereqs_met?.length ? <span style={{ color: C.green }}> — You have: {xai.prereqs_met.join(", ")}</span> : null}
+          {xai?.prereqs_missing?.length ? <span style={{ color: C.amber }}> — Learn first: {xai.prereqs_missing.join(", ")}</span> : null}
+        </div>
+      )}
+      {xai?.reason && (
+        <>
+          <button type="button" style={{ fontSize: 10, color: C.p2, background: "none", border: "none", cursor: "pointer", padding: 0, textAlign: "left", fontWeight: 600 }} onClick={() => setExpanded(!expanded)}>
+            {expanded ? "▼ Hide why this order" : "▶ Why this order?"}
+          </button>
+          {expanded && <div style={{ fontSize: 11, color: C.muted, lineHeight: 1.5 }}>{xai.reason}</div>}
+        </>
+      )}
+    </div>
+  );
+}
+
+function RoadmapTab({
+  roadData,
+  roadLoad,
+  showLoadingPlaceholder,
+  onGenerate,
+  onRefresh,
+}: {
+  roadData: any;
+  roadLoad: boolean;
+  showLoadingPlaceholder?: boolean;
+  onGenerate: () => void;
+  onRefresh?: () => void;
+}) {
+  const showLoading = roadLoad || !!showLoadingPlaceholder;
+  const phases = roadData?.phases || {};
+  const beginner = (phases.beginner || []) as RoadmapPhaseItem[];
+  const intermediate = (phases.intermediate || []) as RoadmapPhaseItem[];
+  const advanced = (phases.advanced || []) as RoadmapPhaseItem[];
+  const hasData = beginner.length > 0 || intermediate.length > 0 || advanced.length > 0;
+  const totalWeeks = roadData?.total_weeks ?? 0;
+  const coverage = roadData?.coverage != null ? Math.round(Number(roadData.coverage) * 100) : null;
+  const message = roadData?.message || "Based on your skills gap and market demand.";
+
+  return (
+    <div style={{ background: C.white, border: `1px solid ${C.border}`, borderRadius: 16, padding: "24px 28px", boxShadow: "0 2px 16px rgba(122,63,176,.06)" }}>
+      <div style={{ marginBottom: 20 }}>
+        <h2 style={{ fontSize: 18, fontWeight: 800, color: C.text, marginBottom: 4 }}>🗺️ Learning Roadmap</h2>
+        <p style={{ fontSize: 13, color: C.muted }}>A phased plan from your skills gap. Start with Beginner, then Intermediate, then Advanced when you have the prerequisites.</p>
+      </div>
+
+      {showLoading && (
+        <div style={{ textAlign: "center", padding: 48, color: C.muted }}>
+          <div style={{ display: "flex", justifyContent: "center", gap: 6, marginBottom: 12 }}>
+            {[0, 120, 240].map(d => <div key={d} style={{ width: 8, height: 8, borderRadius: "50%", background: C.p1, animation: `bounce 0.8s ${d}ms ease-in-out infinite` }} />)}
+          </div>
+          <div style={{ fontSize: 14, fontWeight: 600 }}>Generating roadmap…</div>
+        </div>
+      )}
+
+      {!showLoading && !hasData && (
+        <div style={{ textAlign: "center", padding: "48px 24px" }}>
+          <div style={{ fontSize: 42, marginBottom: 16 }}>🗺️</div>
+          <div style={{ fontSize: 16, fontWeight: 700, color: C.text, marginBottom: 8 }}>Your personalized learning roadmap</div>
+          <div style={{ fontSize: 13, color: C.muted, marginBottom: 24, maxWidth: 400, margin: "0 auto 24px" }}>
+            We'll build a phased plan (Beginner → Intermediate → Advanced) from your skills gap. Run a scan first so we have your skills.
+          </div>
+          <button style={S.btn} onClick={onGenerate}>Generate Learning Roadmap</button>
+          {roadData?.detail && <div style={{ marginTop: 16, fontSize: 12, color: C.amber }}>{roadData.detail}</div>}
+        </div>
+      )}
+
+      {!showLoading && hasData && (
+        <div style={{ display: "flex", flexDirection: "column", gap: 20 }}>
+          <div style={{ display: "flex", gap: 12, flexWrap: "wrap", alignItems: "center", justifyContent: "space-between" }}>
+            <div style={{ display: "flex", gap: 12, flexWrap: "wrap", alignItems: "center" }}>
+              <div style={{ ...S.sec, minWidth: 100, marginBottom: 0, textAlign: "center" }}>
+                <div style={{ fontSize: 22, fontWeight: 800, color: C.p1 }}>{totalWeeks}w</div>
+                <div style={{ fontSize: 10, color: C.muted }}>Total plan</div>
+              </div>
+              {coverage != null && (
+                <div style={{ ...S.sec, minWidth: 100, marginBottom: 0, textAlign: "center" }}>
+                  <div style={{ fontSize: 22, fontWeight: 800, color: C.text }}>{coverage}%</div>
+                  <div style={{ fontSize: 10, color: C.muted }}>Market coverage</div>
+                </div>
+              )}
+            </div>
+            {onRefresh && <button style={S.btnOut} onClick={onRefresh}>🔄 Refresh roadmap</button>}
+          </div>
+          <div style={{ fontSize: 12, color: C.muted }}>{message}</div>
+
+          {beginner.length > 0 && (
+            <div>
+              <div style={{ fontSize: 11, color: C.muted, marginBottom: 8, textTransform: "uppercase", letterSpacing: "0.05em" }}>Beginner — foundations</div>
+              <div style={{ display: "flex", flexDirection: "column", gap: 10 }}>
+                {beginner.map(item => <RoadmapPhaseCard key={item.skill} item={item} />)}
+              </div>
+            </div>
+          )}
+          {intermediate.length > 0 && (
+            <div>
+              <div style={{ fontSize: 11, color: C.muted, marginBottom: 8, textTransform: "uppercase", letterSpacing: "0.05em" }}>Intermediate — core skills</div>
+              <div style={{ display: "flex", flexDirection: "column", gap: 10 }}>
+                {intermediate.map(item => <RoadmapPhaseCard key={item.skill} item={item} />)}
+              </div>
+            </div>
+          )}
+          {advanced.length > 0 && (
+            <div>
+              <div style={{ fontSize: 11, color: C.muted, marginBottom: 8, textTransform: "uppercase", letterSpacing: "0.05em" }}>Advanced — specialization</div>
+              <div style={{ display: "flex", flexDirection: "column", gap: 10 }}>
+                {advanced.map(item => <RoadmapPhaseCard key={item.skill} item={item} />)}
+              </div>
+            </div>
+          )}
+        </div>
+      )}
+    </div>
+  );
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+//  Dashboard
 // ─────────────────────────────────────────────────────────────────────────────
 
 function MatchesTab({ isScanning, scanJobs, jobs, jobsLoad, roleFilter, setRoleFilter, locFilter, setLocFilter, minFit, setMinFit, onSearch }: {
@@ -749,6 +1128,31 @@ function MatchesTab({ isScanning, scanJobs, jobs, jobsLoad, roleFilter, setRoleF
   minFit: number;     setMinFit:     (v: number) => void;
   onSearch: () => void;
 }) {
+  // Apply filters and sort by AI match (match_score) so list matches backend order and filters work
+  const filteredAndSortedJobs = useMemo(() => {
+    let list = [...jobs];
+    if (roleFilter.trim()) {
+      const words = roleFilter.trim().toLowerCase().split(/\s+/).filter(Boolean);
+      list = list.filter(j => {
+        const text = `${j.title || ""} ${j.industry || ""} ${(j.description || "")}`.toLowerCase();
+        return words.some(w => text.includes(w));
+      });
+    }
+    if (locFilter.trim()) {
+      const loc = locFilter.trim().toLowerCase();
+      list = list.filter(j => {
+        const jLoc = (j.location || "").toLowerCase();
+        const jRemote = (j.remote || "").toLowerCase();
+        return jLoc.includes(loc) || (loc.includes("remote") && (jRemote.includes("remote") || jLoc.includes("remote")));
+      });
+    }
+    if (minFit > 0) {
+      list = list.filter(j => normalizeScore(j.match_score) >= minFit);
+    }
+    list.sort((a, b) => (normalizeScore(b.match_score) || 0) - (normalizeScore(a.match_score) || 0));
+    return list;
+  }, [jobs, roleFilter, locFilter, minFit]);
+
   return (
     <div>
       <div style={{ ...S.sec, display: "flex", gap: 10, alignItems: "center", flexWrap: "wrap", marginBottom: 16 }}>
@@ -762,7 +1166,7 @@ function MatchesTab({ isScanning, scanJobs, jobs, jobsLoad, roleFilter, setRoleF
         </select>
         <button style={S.btn} onClick={onSearch} disabled={isScanning}>Search</button>
         <span style={{ fontSize: 11, color: C.muted }}>
-          {isScanning ? `${scanJobs.length} matched so far…` : `${jobs.length} jobs · Cosine + AI Match`}
+          {isScanning ? `${scanJobs.length} matched so far…` : `${filteredAndSortedJobs.length} jobs · Cosine + AI Match`}
         </span>
       </div>
 
@@ -802,7 +1206,14 @@ function MatchesTab({ isScanning, scanJobs, jobs, jobsLoad, roleFilter, setRoleF
 
       {!isScanning && jobs.length > 0 && (
         <div style={{ display: "grid", gridTemplateColumns: "repeat(auto-fill,minmax(310px,1fr))", gap: 14 }}>
-          {jobs.map((job, i) => <JobCard key={`${job.url}-${i}`} job={job} />)}
+          {filteredAndSortedJobs.length === 0 ? (
+            <div style={{ gridColumn: "1 / -1", textAlign: "center", padding: "40px 20px", color: C.muted }}>
+              <div style={{ fontSize: 15, fontWeight: 600, color: C.text, marginBottom: 8 }}>No jobs match your filters</div>
+              <div style={{ fontSize: 12 }}>Try loosening the role, location or minimum score.</div>
+            </div>
+          ) : (
+            filteredAndSortedJobs.map((job, i) => <JobCard key={`${job.url}-${i}`} job={job} />)
+          )}
         </div>
       )}
     </div>
@@ -851,8 +1262,14 @@ function Dashboard() {
   }, []);
 
   useEffect(() => {
-    if (activeTab === "gap"     && !gapData  && userId) loadGap();
-    if (activeTab === "roadmap" && !roadData && userId) loadRoadmap();
+    if (activeTab === "gap" && userId && !gapData) {
+      setGapLoad(true);
+      loadGap();
+    }
+    if (activeTab === "roadmap" && userId && !roadData) {
+      setRoadLoad(true);
+      loadRoadmap();
+    }
     if (activeTab === "market"  && !mktData  && userId) loadMarket();
     if (activeTab === "report"  && !repData  && userId) loadReport();
   }, [activeTab]);
@@ -901,13 +1318,13 @@ function Dashboard() {
 
   async function loadGap() {
     setGapLoad(true);
-    try { const r = await fetch("/api/gap", { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ user_id: userId }) }); setGapData(await r.json()); }
+    try { const r = await fetch("/api/gap", { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ user_id: String(userId) }) }); setGapData(await r.json()); }
     finally { setGapLoad(false); }
   }
 
   async function loadRoadmap() {
     setRoadLoad(true);
-    try { const r = await fetch("/api/roadmap", { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ user_id: userId }) }); setRoadData(await r.json()); }
+    try { const r = await fetch("/api/roadmap", { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ user_id: String(userId) }) }); setRoadData(await r.json()); }
     finally { setRoadLoad(false); }
   }
 
@@ -969,13 +1386,20 @@ function Dashboard() {
             case "done":
               setPipeSteps(p => ({ ...p, scrape: "done", enrich: "done", dbjobs: "done" }));
               reader.cancel();
+              // Keep scan result (with xai) visible after scan: copy scanJobs into jobs
+              // so when isScanning becomes false we show the same cards (with xai).
+              setScanJobs(prev => {
+                if (prev.length) setJobs([...prev]);
+                return prev;
+              });
               break;
           }
         }
       }
       const r = await fetch("/api/login", { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ user_id: userId }) });
       if (r.ok) { const d = await r.json(); setUserName(d.name || `User #${userId}`); }
-      await loadJobs();
+      // Do not call loadJobs() here: we already set jobs from scanJobs above so xai stays visible.
+      // User can click "Search" to refresh from DB.
     } catch (err) {
       console.error("Scan error:", err);
     } finally {
@@ -1019,7 +1443,11 @@ function Dashboard() {
 
           <div style={{ display: "flex", gap: 6, marginBottom: 18, flexWrap: "wrap" }}>
             {(["matches", "gap", "roadmap", "market", "report"] as Tab[]).map(tab => (
-              <button key={tab} style={S.tab(activeTab === tab)} onClick={() => setActiveTab(tab)}>
+              <button
+                key={tab}
+                style={S.tab(activeTab === tab)}
+                onClick={() => setActiveTab(tab)}
+              >
                 {{ matches: "🏆 Matches", gap: "📊 Skills Gap", roadmap: "🗺️ Roadmap", market: "📈 Market", report: "📄 Report" }[tab]}
               </button>
             ))}
@@ -1030,69 +1458,24 @@ function Dashboard() {
           )}
 
           {activeTab === "gap" && (
-            <div>
-              {gapLoad ? <div style={{ textAlign: "center", padding: 40, color: C.muted }}>Analyzing skills gap…</div>
-               : !gapData ? <button style={S.btn} onClick={loadGap}>Analyze Skills Gap</button>
-               : (
-                <div style={{ display: "flex", flexDirection: "column", gap: 16 }}>
-                  <div style={{ fontSize: 13, fontWeight: 700, color: C.text }}>📊 Top {gapData.top_missing_skills?.length || 0} missing skills across {gapData.total_jobs_analyzed} jobs</div>
-                  <VerticalChart data={gapData.top_missing_skills || []} title="Missing Skills Frequency" valueKey="frequency" labelKey="skill" barColor={C.p0} height={260} />
-                  {gapData.cv_skills && (
-                    <div style={S.sec}>
-                      <div style={{ fontSize: 11, color: C.muted, marginBottom: 8, textTransform: "uppercase" }}>Your Current Skills</div>
-                      <div style={{ display: "flex", flexWrap: "wrap", gap: 4 }}>
-                        {gapData.cv_skills.split(",").slice(0, 20).map((s: string) => s.trim()).filter(Boolean).map((s: string) => (
-                          <span key={s} style={{ fontSize: 10, padding: "2px 8px", borderRadius: 4, background: "rgba(22,163,74,.07)", color: C.green, border: "1px solid rgba(22,163,74,.2)" }}>✓ {s}</span>
-                        ))}
-                      </div>
-                    </div>
-                  )}
-                </div>
-              )}
-            </div>
+            <GapTab
+              gapData={gapData}
+              gapLoad={gapLoad}
+              showLoadingPlaceholder={activeTab === "gap" && !!userId && !gapData}
+              onAnalyze={loadGap}
+              onGoToRoadmap={() => setActiveTab("roadmap")}
+              onRefresh={() => { setGapData(null); setGapLoad(true); loadGap(); }}
+            />
           )}
 
           {activeTab === "roadmap" && (
-            <div>
-              {roadLoad ? <div style={{ textAlign: "center", padding: 40, color: C.muted }}>Generating roadmap…</div>
-               : !roadData ? <button style={S.btn} onClick={loadRoadmap}>Generate Learning Roadmap</button>
-               : (
-                <div>
-                  <div style={{ ...S.sec, marginBottom: 16, display: "flex", justifyContent: "space-between", alignItems: "center" }}>
-                    <div>
-                      <div style={{ fontSize: 14, fontWeight: 700, color: C.text }}>🗺️ Your Personalized Learning Roadmap</div>
-                      <div style={{ fontSize: 11, color: C.muted }}>{roadData.message}</div>
-                    </div>
-                    <div style={{ textAlign: "right" }}>
-                      <div style={{ fontSize: 22, fontWeight: 800, color: C.p1 }}>{roadData.total_weeks}w</div>
-                      <div style={{ fontSize: 10, color: "#9f8fb0" }}>total plan</div>
-                    </div>
-                  </div>
-                  <div style={{ display: "flex", flexDirection: "column", gap: 10 }}>
-                    {(roadData.roadmap || []).map((item: RoadmapItem) => {
-                      const dc = item.difficulty === "beginner" ? "#22c55e" : item.difficulty === "intermediate" ? "#f59e0b" : "#ef4444";
-                      return (
-                        <div key={item.skill} style={{ ...S.sec, display: "flex", gap: 14, alignItems: "flex-start" }}>
-                          <div style={{ textAlign: "center", minWidth: 56 }}>
-                            <div style={{ fontSize: 18, fontWeight: 800, color: C.p1 }}>W{item.week_start}</div>
-                            <div style={{ fontSize: 9, color: "#9f8fb0" }}>–W{item.week_end}</div>
-                          </div>
-                          <div style={{ flex: 1 }}>
-                            <div style={{ display: "flex", gap: 8, alignItems: "center", marginBottom: 6 }}>
-                              <span style={{ fontWeight: 700, fontSize: 13, color: C.text }}>{item.skill}</span>
-                              <span style={{ fontSize: 9, padding: "1px 7px", borderRadius: 4, background: `${dc}22`, color: dc, border: `1px solid ${dc}44` }}>{item.difficulty}</span>
-                              <span style={{ fontSize: 9, padding: "1px 7px", borderRadius: 4, background: "rgba(122,63,176,.07)", color: C.p2, border: "1px solid rgba(122,63,176,.2)" }}>{item.priority}</span>
-                            </div>
-                            <div style={{ fontSize: 11, color: C.muted }}>📚 {item.resources.join(" · ")}</div>
-                            <div style={{ fontSize: 10, color: "#9f8fb0", marginTop: 3 }}>{item.duration}</div>
-                          </div>
-                        </div>
-                      );
-                    })}
-                  </div>
-                </div>
-              )}
-            </div>
+            <RoadmapTab
+              roadData={roadData}
+              roadLoad={roadLoad}
+              showLoadingPlaceholder={activeTab === "roadmap" && !!userId && !roadData}
+              onGenerate={loadRoadmap}
+              onRefresh={() => { setRoadData(null); setRoadLoad(true); loadRoadmap(); }}
+            />
           )}
 
           {activeTab === "market" && (
@@ -1103,10 +1486,10 @@ function Dashboard() {
                 <div style={{ display: "flex", flexDirection: "column", gap: 16 }}>
                   <div style={{ display: "flex", gap: 12, flexWrap: "wrap" }}>
                     {[
-                      { label: "Total Jobs",   value: mktData.total_jobs },
-                      { label: "Avg AI Score", value: `${mktData.avg_ai_score}%` },
-                      { label: "Excellent",    value: mktData.score_breakdown?.excellent || 0 },
-                      { label: "Good",         value: mktData.score_breakdown?.good || 0 },
+                      { label: "Total Jobs",   value: mktData.total_jobs ?? "—" },
+                      { label: "Avg AI Score", value: mktData.avg_ai_score != null ? `${mktData.avg_ai_score}%` : "—" },
+                      { label: "Excellent",    value: mktData.score_breakdown?.excellent ?? 0 },
+                      { label: "Good",         value: mktData.score_breakdown?.good ?? 0 },
                     ].map(({ label, value }) => (
                       <div key={label} style={{ ...S.sec, flex: 1, minWidth: 120, marginBottom: 0, textAlign: "center" }}>
                         <div style={{ fontSize: 22, fontWeight: 800, color: C.p1 }}>{value}</div>
@@ -1133,14 +1516,41 @@ function Dashboard() {
 
           {activeTab === "report" && (
             <div>
-              <div style={{ display: "flex", gap: 10, marginBottom: 16 }}>
-                <button style={S.btn} onClick={loadReport} disabled={repLoad}>{repLoad ? "Generating…" : "🔄 Regenerate Report"}</button>
-                <button style={{ ...S.btn, background: "linear-gradient(135deg,#22c55e,#16a34a)" }} onClick={downloadPDF}>📄 Download PDF</button>
-              </div>
-              {repData
-                ? <div style={{ ...S.sec, maxHeight: 600, overflowY: "auto" }}><pre style={{ fontSize: 11, lineHeight: 1.7, color: "#4a3f60", whiteSpace: "pre-wrap", fontFamily: MONO }}>{repData}</pre></div>
-                : <div style={{ textAlign: "center", padding: 40, color: C.muted }}>Click "Regenerate Report" to generate your career analysis.</div>
-              }
+              {repLoad ? (
+                <div style={{ textAlign: "center", padding: 48, color: C.muted }}>
+                  <div style={{ display: "flex", justifyContent: "center", gap: 6, marginBottom: 12 }}>
+                    {[0, 120, 240].map(d => <div key={d} style={{ width: 8, height: 8, borderRadius: "50%", background: C.p1, animation: `bounce 0.8s ${d}ms ease-in-out infinite` }} />)}
+                  </div>
+                  <div style={{ fontSize: 15, fontWeight: 600 }}>Generating your report…</div>
+                  <div style={{ fontSize: 12, marginTop: 8 }}>Profile, market, skills gap, roadmap &amp; matches</div>
+                </div>
+              ) : repData ? (
+                <div style={{ display: "flex", flexDirection: "column", gap: 16 }}>
+                  <div style={{ display: "flex", alignItems: "center", justifyContent: "space-between", flexWrap: "wrap", gap: 12 }}>
+                    <p style={{ fontSize: 14, color: C.text, margin: 0 }}>
+                      Your career report is ready. It includes your profile, market overview, skills gap, learning roadmap, and top job matches.
+                    </p>
+                    <button
+                      style={{ ...S.btn, background: "linear-gradient(135deg,#22c55e,#16a34a)", color: "white", fontWeight: 700 }}
+                      onClick={downloadPDF}
+                    >
+                      📄 Download PDF
+                    </button>
+                  </div>
+                  <div style={{ ...S.sec, maxHeight: 520, overflowY: "auto" }}>
+                    <pre style={{ fontSize: 11, lineHeight: 1.65, color: "#4a3f60", whiteSpace: "pre-wrap", fontFamily: MONO, margin: 0 }}>{repData}</pre>
+                  </div>
+                  <div style={{ display: "flex", gap: 10 }}>
+                    <button style={S.btn} onClick={loadReport} disabled={repLoad}>🔄 Regenerate report</button>
+                    <button style={{ ...S.btn, background: "linear-gradient(135deg,#22c55e,#16a34a)", color: "white" }} onClick={downloadPDF}>📄 Download PDF</button>
+                  </div>
+                </div>
+              ) : (
+                <div style={{ textAlign: "center", padding: 40, color: C.muted }}>
+                  <p style={{ marginBottom: 16 }}>Open the Report tab to generate your career report.</p>
+                  <button style={S.btn} onClick={loadReport}>Generate report</button>
+                </div>
+              )}
             </div>
           )}
 
