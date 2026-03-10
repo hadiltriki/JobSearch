@@ -4,7 +4,8 @@
 // ─────────────────────────────────────────────────────────────────────────────
 
 import { useState, useEffect, useRef, Suspense, useCallback, useMemo } from "react";
-import { useVoice, type VoiceState } from "@/app/lib/useVoice";
+// Voice/Deepgram disabled for first release
+// import { useVoice, type VoiceState } from "@/app/lib/useVoice";
 import { useRouter, useSearchParams } from "next/navigation";
 import {
   GRAD, FONT, MONO, C, S, GLOBAL_CSS,
@@ -412,48 +413,42 @@ function ScanningBanner({ pipeSteps, pipeRole, enrichN }: {
 //  ChatSidebar
 // ─────────────────────────────────────────────────────────────────────────────
 
-// ── Couleurs état voice ───────────────────────────────────────────────────────
-const VOICE_COLORS: Record<string, string> = {
-  idle:       C.p1,
-  listening:  "#e53e3e",   // rouge pulsant = en écoute
-  processing: "#d69e2e",   // jaune = traitement STT
-  speaking:   "#38a169",   // vert = lecture TTS
-  error:      "#e53e3e",
-};
-
-// ── Icône micro SVG inline ─────────────────────────────────────────────────
-function MicIcon({ size = 16, color = "currentColor" }: { size?: number; color?: string }) {
-  return (
-    <svg width={size} height={size} viewBox="0 0 24 24" fill="none" stroke={color}
-      strokeWidth="2" strokeLinecap="round" strokeLinejoin="round">
-      <path d="M12 1a3 3 0 0 0-3 3v8a3 3 0 0 0 6 0V4a3 3 0 0 0-3-3z"/>
-      <path d="M19 10v2a7 7 0 0 1-14 0v-2"/>
-      <line x1="12" y1="19" x2="12" y2="23"/>
-      <line x1="8"  y1="23" x2="16" y2="23"/>
-    </svg>
-  );
-}
-
-// ── Icône stop ─────────────────────────────────────────────────────────────
-function StopIcon({ size = 14, color = "currentColor" }: { size?: number; color?: string }) {
-  return (
-    <svg width={size} height={size} viewBox="0 0 24 24" fill={color}>
-      <rect x="4" y="4" width="16" height="16" rx="2"/>
-    </svg>
-  );
-}
-
-// ── Icône speaker ──────────────────────────────────────────────────────────
-function SpeakerIcon({ size = 14, color = "currentColor" }: { size?: number; color?: string }) {
-  return (
-    <svg width={size} height={size} viewBox="0 0 24 24" fill="none" stroke={color}
-      strokeWidth="2" strokeLinecap="round" strokeLinejoin="round">
-      <polygon points="11 5 6 9 2 9 2 15 6 15 11 19 11 5"/>
-      <path d="M15.54 8.46a5 5 0 0 1 0 7.07"/>
-      <path d="M19.07 4.93a10 10 0 0 1 0 14.14"/>
-    </svg>
-  );
-}
+// ── Voice/Deepgram disabled for first release ───────────────────────────────
+// const VOICE_COLORS: Record<string, string> = {
+//   idle:       C.p1,
+//   listening:  "#e53e3e",
+//   processing: "#d69e2e",
+//   speaking:   "#38a169",
+//   error:      "#e53e3e",
+// };
+// function MicIcon({ size = 16, color = "currentColor" }: { size?: number; color?: string }) {
+//   return (
+//     <svg width={size} height={size} viewBox="0 0 24 24" fill="none" stroke={color}
+//       strokeWidth="2" strokeLinecap="round" strokeLinejoin="round">
+//       <path d="M12 1a3 3 0 0 0-3 3v8a3 3 0 0 0 6 0V4a3 3 0 0 0-3-3z"/>
+//       <path d="M19 10v2a7 7 0 0 1-14 0v-2"/>
+//       <line x1="12" y1="19" x2="12" y2="23"/>
+//       <line x1="8"  y1="23" x2="16" y2="23"/>
+//     </svg>
+//   );
+// }
+// function StopIcon({ size = 14, color = "currentColor" }: { size?: number; color?: string }) {
+//   return (
+//     <svg width={size} height={size} viewBox="0 0 24 24" fill={color}>
+//       <rect x="4" y="4" width="16" height="16" rx="2"/>
+//     </svg>
+//   );
+// }
+// function SpeakerIcon({ size = 14, color = "currentColor" }: { size?: number; color?: string }) {
+//   return (
+//     <svg width={size} height={size} viewBox="0 0 24 24" fill="none" stroke={color}
+//       strokeWidth="2" strokeLinecap="round" strokeLinejoin="round">
+//       <polygon points="11 5 6 9 2 9 2 15 6 15 11 19 11 5"/>
+//       <path d="M15.54 8.46a5 5 0 0 1 0 7.07"/>
+//       <path d="M19.07 4.93a10 10 0 0 1 0 14.14"/>
+//     </svg>
+//   );
+// }
 
 function ChatSidebar({ userId, jobs = [] }: { userId: number; jobs?: Job[] }) {
   const [msgs,    setMsgs]    = useState<Message[]>([]);
@@ -463,30 +458,35 @@ function ChatSidebar({ userId, jobs = [] }: { userId: number; jobs?: Job[] }) {
   const [ttsEnabled, setTtsEnabled] = useState(true);  // TTS activé par défaut
   const endRef = useRef<HTMLDivElement>(null);
 
-  // ── Détection langue active (fr/en) pour STT + TTS ───────────────────────
+  // ── Détection langue active (fr/en) — used when voice re-enabled ─────────
   const [activeLang, setActiveLang] = useState<"fr" | "en">("fr");
 
-  // ── Hook Voice ────────────────────────────────────────────────────────────
-  const {
-    voiceState, voiceError, detectedLang,
-    startListening, stopListening, speakText, cancelSpeech,
-  } = useVoice({
-    defaultLang:        activeLang,       // langue par défaut (toggle FR/EN)
-    silenceThresholdMs: 2000,             // 2s silence → arrêt auto
-    silenceRmsThreshold: 0.012,
-    onTranscript: (text: string, lang: string) => {
-      // lang = langue détectée par Deepgram ("fr" ou "en")
-      // On met à jour activeLang pour que le TTS suive automatiquement
-      setActiveLang(lang as "fr" | "en");
-      setInput(text);
-      setTimeout(() => sendVoice(text, lang), 100);
-    },
-  });
+  // ── Voice/Deepgram disabled for first release ─────────────────────────────
+  // const {
+  //   voiceState, voiceError, detectedLang,
+  //   startListening, stopListening, speakText, cancelSpeech,
+  // } = useVoice({
+  //   defaultLang:        activeLang,
+  //   silenceThresholdMs: 2000,
+  //   silenceRmsThreshold: 0.012,
+  //   onTranscript: (text: string, lang: string) => {
+  //     setActiveLang(lang as "fr" | "en");
+  //     setInput(text);
+  //     setTimeout(() => sendVoice(text, lang), 100);
+  //   },
+  // });
+  const voiceState = "idle" as const;
+  const voiceError = "";
+  const detectedLang = activeLang;
+  const startListening = () => {};
+  const stopListening = () => {};
+  const speakText = useCallback(async (_text: string, _lang?: string) => {}, []);
+  const cancelSpeech = useCallback(() => {}, []);
 
-  const isListening  = voiceState === "listening";
-  const isProcessing = voiceState === "processing";
-  const isSpeaking   = voiceState === "speaking";
-  const micBusy      = voiceState !== "idle" && voiceState !== "error";
+  const isListening  = false; // voiceState === "listening";
+  const isProcessing = false; // voiceState === "processing";
+  const isSpeaking   = false; // voiceState === "speaking";
+  const micBusy      = false; // voiceState !== "idle" && voiceState !== "error";
 
   // ── Charger l'historique depuis la DB au montage ──────────────────────────
   useEffect(() => {
@@ -499,7 +499,7 @@ function ChatSidebar({ userId, jobs = [] }: { userId: number; jobs?: Job[] }) {
 
   // ── Écouter l'event logout → vider les msgs locaux ────────────────────────
   useEffect(() => {
-    const handleLogout = () => { setMsgs([]); cancelSpeech(); };
+    const handleLogout = () => { setMsgs([]); cancelSpeech(); }; // cancelSpeech = noop when voice disabled
     window.addEventListener("jobscan:logout", handleLogout);
     return () => window.removeEventListener("jobscan:logout", handleLogout);
   }, [cancelSpeech]);
@@ -544,13 +544,11 @@ function ChatSidebar({ userId, jobs = [] }: { userId: number; jobs?: Job[] }) {
       const d = await r.json();
       if (d.response) {
         setMsgs(p => [...p, { role: "assistant", content: d.response }]);
-        // Lire la réponse si TTS activé
-        if (ttsEnabled) {
-          // voiceLang = langue détectée par Deepgram STT
-          // → Deepgram TTS répondra avec le même accent (FR→FR, EN→EN)
-          const ttsLang = voiceLang || detectedLang || activeLang;
-          await speakText(d.response, ttsLang);
-        }
+        // Voice/Deepgram disabled for first release — TTS commented out
+        // if (ttsEnabled) {
+        //   const ttsLang = voiceLang || detectedLang || activeLang;
+        //   await speakText(d.response, ttsLang);
+        // }
       } else {
         setChatErr("Empty response from server.");
       }
@@ -574,28 +572,10 @@ function ChatSidebar({ userId, jobs = [] }: { userId: number; jobs?: Job[] }) {
     _sendMessage(text, lang);
   }, [loading]); // eslint-disable-line react-hooks/exhaustive-deps
 
-  // ── Gestion bouton micro ──────────────────────────────────────────────────
-  const handleMicClick = () => {
-    if (isSpeaking) {
-      cancelSpeech();
-      return;
-    }
-    if (isListening) {
-      stopListening();
-      return;
-    }
-    if (!micBusy) {
-      startListening();
-    }
-  };
-
-  // ── Label tooltip micro ───────────────────────────────────────────────────
-  const micTooltip = isListening  ? "Cliquez pour arrêter (ou silence 2s)"
-                   : isProcessing ? "Transcription en cours…"
-                   : isSpeaking   ? "Cliquez pour arrêter la lecture"
-                   : "Cliquez pour parler";
-
-  const micColor = VOICE_COLORS[voiceState] || C.p1;
+  // Voice/Deepgram disabled — mic handlers commented
+  // const handleMicClick = () => { ... };
+  // const micTooltip = ...;
+  // const micColor = VOICE_COLORS[voiceState] || C.p1;
 
   return (
     <div style={{
@@ -610,35 +590,11 @@ function ChatSidebar({ userId, jobs = [] }: { userId: number; jobs?: Job[] }) {
       <div style={{ display: "flex", alignItems: "center", justifyContent: "space-between", marginBottom: 14, paddingBottom: 12, borderBottom: `1px solid ${C.border}` }}>
         <div style={{ fontWeight: 800, fontSize: 14, color: C.p1, letterSpacing: -0.3 }}>💬 Career Assistant</div>
 
-        {/* Contrôles header : langue + TTS toggle */}
-        <div style={{ display: "flex", alignItems: "center", gap: 6 }}>
-          {/* Toggle langue STT/TTS */}
-          <button
-            title={`Langue : ${activeLang.toUpperCase()} — cliquez pour changer`}
-            onClick={() => setActiveLang(l => l === "fr" ? "en" : "fr")}
-            style={{
-              fontSize: 10, fontWeight: 700, color: C.muted,
-              background: "none", border: `1px solid ${C.border}`,
-              borderRadius: 4, padding: "2px 5px", cursor: "pointer",
-              letterSpacing: 0.5,
-            }}
-          >
-            {activeLang.toUpperCase()}
-          </button>
-
-          {/* Toggle TTS on/off */}
-          <button
-            title={ttsEnabled ? "Désactiver la lecture vocale" : "Activer la lecture vocale"}
-            onClick={() => { setTtsEnabled(v => !v); if (isSpeaking) cancelSpeech(); }}
-            style={{
-              background: "none", border: "none", cursor: "pointer",
-              opacity: ttsEnabled ? 1 : 0.35, padding: 2,
-              display: "flex", alignItems: "center",
-            }}
-          >
-            <SpeakerIcon size={15} color={C.muted} />
-          </button>
-        </div>
+        {/* Voice/Deepgram disabled for first release — lang + TTS toggles commented */}
+        {/* <div style={{ display: "flex", alignItems: "center", gap: 6 }}>
+          <button title={`Langue : ${activeLang.toUpperCase()}`} onClick={() => setActiveLang(l => l === "fr" ? "en" : "fr")} style={{ fontSize: 10, fontWeight: 700, color: C.muted, background: "none", border: `1px solid ${C.border}`, borderRadius: 4, padding: "2px 5px", cursor: "pointer", letterSpacing: 0.5 }}>{activeLang.toUpperCase()}</button>
+          <button title={ttsEnabled ? "Désactiver la lecture vocale" : "Activer la lecture vocale"} onClick={() => { setTtsEnabled(v => !v); if (isSpeaking) cancelSpeech(); }} style={{ background: "none", border: "none", cursor: "pointer", opacity: ttsEnabled ? 1 : 0.35, padding: 2, display: "flex", alignItems: "center" }}><SpeakerIcon size={15} color={C.muted} /></button>
+        </div> */}
       </div>
 
       {/* ── Messages ── */}
@@ -650,7 +606,7 @@ function ChatSidebar({ userId, jobs = [] }: { userId: number; jobs?: Job[] }) {
           <div style={{ fontSize: 12, color: C.muted, textAlign: "center", marginTop: 32, lineHeight: 1.9, padding: "0 10px" }}>
             <div style={{ fontSize: 28, marginBottom: 10 }}>🤖</div>
             Ask me about your job matches, skills gap, roadmap or score explanations.
-            <div style={{ marginTop: 10, fontSize: 11, opacity: 0.6 }}>🎙 Click the mic to speak</div>
+            {/* Voice disabled: <div style={{ marginTop: 10, fontSize: 11, opacity: 0.6 }}>🎙 Click the mic to speak</div> */}
           </div>
         )}
         {msgs.map((m, i) => (
@@ -677,23 +633,9 @@ function ChatSidebar({ userId, jobs = [] }: { userId: number; jobs?: Job[] }) {
         )}
         {chatErr && <div style={{ fontSize: 11, color: C.red, padding: "4px 12px" }}>⚠ {chatErr}</div>}
 
-        {/* Status voice */}
-        {voiceState !== "idle" && (
-          <div style={{
-            fontSize: 10, color: micColor, padding: "4px 10px",
-            background: `${micColor}12`, borderRadius: 6,
-            display: "flex", alignItems: "center", gap: 6,
-          }}>
-            {isListening  && <><span style={{ animation: "pulse 1s ease-in-out infinite" }}>🔴</span> Écoute en cours ({activeLang.toUpperCase()})… silence 2s pour arrêter</>}
-            {isProcessing && <><span>⏳</span> Transcription…</>}
-            {isSpeaking   && <><span>🔊</span> Lecture vocale… <button onClick={cancelSpeech} style={{ fontSize: 9, color: C.muted, background: "none", border: "none", cursor: "pointer", textDecoration: "underline" }}>stop</button></>}
-          </div>
-        )}
-        {voiceError && (
-          <div style={{ fontSize: 10, color: C.red, padding: "4px 10px", background: "#fff0f0", borderRadius: 6 }}>
-            ⚠ {voiceError}
-          </div>
-        )}
+        {/* Voice/Deepgram disabled for first release — status + error commented */}
+        {/* {voiceState !== "idle" && ( ... )} */}
+        {/* {voiceError && ( ... )} */}
 
         <div ref={endRef} />
       </div>
@@ -701,45 +643,23 @@ function ChatSidebar({ userId, jobs = [] }: { userId: number; jobs?: Job[] }) {
       {/* ── Zone de saisie ── */}
       <div style={{ display: "flex", gap: 8, marginTop: 12, alignItems: "center", paddingTop: 12, borderTop: `1px solid ${C.border}` }}>
 
-        {/* Bouton micro */}
-        <button
-          title={micTooltip}
-          onClick={handleMicClick}
-          disabled={isProcessing}
-          style={{
-            width: 38, height: 38, borderRadius: "50%", flexShrink: 0,
-            border: `2px solid ${micColor}`,
-            background: isListening ? `${micColor}18` : "white",
-            cursor: isProcessing ? "not-allowed" : "pointer",
-            display: "flex", alignItems: "center", justifyContent: "center",
-            transition: "all .2s",
-            animation: isListening ? "pulse 1.2s ease-in-out infinite" : "none",
-            opacity: isProcessing ? 0.6 : 1,
-          }}
-        >
-          {isSpeaking
-            ? <StopIcon  size={14} color={micColor} />
-            : isListening
-            ? <StopIcon  size={14} color={micColor} />
-            : <MicIcon   size={16} color={micColor} />
-          }
-        </button>
+        {/* Voice/Deepgram disabled for first release — mic button commented */}
+        {/* <button title={micTooltip} onClick={handleMicClick} ...><MicIcon /></button> */}
 
         {/* Input texte */}
         <input
           style={{ ...S.input, fontSize: 12, flex: 1 }}
-          placeholder={isListening ? "Parlez maintenant…" : "Ask anything…"}
+          placeholder="Ask anything…"
           value={input}
           onChange={e => setInput(e.target.value)}
           onKeyDown={e => e.key === "Enter" && !loading && send()}
-          disabled={isListening || isProcessing}
         />
 
         {/* Bouton envoyer */}
         <button
           style={{ ...S.btn, padding: "8px 14px", fontSize: 12 }}
           onClick={send}
-          disabled={loading || isListening || isProcessing}
+          disabled={loading}
         >
           →
         </button>

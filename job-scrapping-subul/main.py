@@ -38,7 +38,8 @@ from job_analyzer_agent import (
 from chat_router       import chat_router
 from scraping_pipeline import scraping_router
 from jobs_router       import jobs_router
-from voice_router      import voice_router
+# Voice/Deepgram disabled for first release
+# from voice_router      import voice_router
 import jobs_router as _jr
 
 logging.basicConfig(level=logging.INFO, format="%(levelname)s  %(message)s")
@@ -63,7 +64,7 @@ app.add_middleware(
 app.include_router(chat_router)
 app.include_router(scraping_router)
 app.include_router(jobs_router)
-app.include_router(voice_router)
+# app.include_router(voice_router)  # Voice/Deepgram disabled for first release
 
 
 # ═══════════════════════════════════════════════════════════════════════════════

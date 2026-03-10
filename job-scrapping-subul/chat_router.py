@@ -28,6 +28,68 @@ try:
 except ImportError:
     _LANGDETECT_AVAILABLE = False
 
+# Short phrases: treat as this language when message is only this (or very short)
+_COMMON_EN = frozenset((
+    "hi", "hello", "hey", "good morning", "good afternoon", "good evening",
+    "goodmorning", "goodnight", "thanks", "thank you", "ok", "okay", "yes", "no",
+    "in english", "english please", "in english please", "answer in english",
+    "respond in english", "reply in english", "i want answers in english",
+))
+_COMMON_FR = frozenset((
+    "bonjour", "bonsoir", "salut", "coucou", "merci", "oui", "non", "ok", "d'accord",
+    "bonne nuit", "bonne soirée", "bonne journée", "à bientôt", "s'il te plaît",
+    "en français", "en francais", "en français s'il te plaît", "réponds en français",
+))
+# French sentence starters: if message begins with these, respond in French
+_FR_STARTERS = (
+    "je veux", "je voudrais", "comment ", "pourquoi ", "qu'est-ce", "c'est quoi",
+    "quel est", "combien ", "est-ce que", "peux-tu", "pouvez-vous", "aide-moi",
+    "aide moi", "dis-moi", "explique", "donne-moi", "je cherche", "j'aimerais",
+)
+
+
+def _detect_response_language(message: str) -> str:
+    """
+    Decide response language: "en" or "fr".
+    - Explicit user request ("in english", "english please", "en français") wins.
+    - Short messages use common phrase list, then langdetect.
+    """
+    msg = (message or "").strip()
+    if not msg:
+        return "fr"
+    low = msg.lower().strip()
+    # Explicit request for English
+    if any(phrase in low for phrase in (
+        "in english", "english please", "answer in english", "respond in english",
+        "reply in english", "i want answers in english", "in english please",
+    )):
+        return "en"
+    # Explicit request for French (e.g. "pourquoi tu ne réponds pas en français")
+    if any(phrase in low for phrase in (
+        "en français", "en francais", "réponds en français", "in french",
+        "reponds en francais", "pas en français", "pas en francais",
+    )):
+        return "fr"
+    # French sentence starters (e.g. "je veux savoir...", "comment apprendre...")
+    if any(low.startswith(s) for s in _FR_STARTERS):
+        return "fr"
+    # Short message: common greetings so langdetect doesn't mis-detect
+    if len(msg) <= 30:
+        if low in _COMMON_EN:
+            return "en"
+        if any(low.startswith(p) for p in ("hi ", "hello ", "hey ", "good morning", "good afternoon", "good evening", "goodmorning ")):
+            return "en"
+        if low in _COMMON_FR or any(low.startswith(p) for p in ("bonjour", "bonsoir", "salut", "merci ")):
+            return "fr"
+    # Use langdetect
+    if _LANGDETECT_AVAILABLE:
+        try:
+            code = _detect_lang(msg)
+            return "fr" if code == "fr" else "en"
+        except Exception:
+            pass
+    return "en"
+
 # ── Imports DB ────────────────────────────────────────────────────────────────
 from database import (
     get_user,
@@ -371,13 +433,8 @@ async def api_chat(data: ChatIn):
         except Exception:
             pass
 
-    # ── Détection langue ──────────────────────────────────────────────────────
-    detected_lang = "fr"
-    if _LANGDETECT_AVAILABLE:
-        try:
-            detected_lang = "fr" if "fr" in _detect_lang(data.message) else "en"
-        except Exception:
-            detected_lang = "fr"
+    # ── Détection langue (texte) : répondre en français ou en anglais selon la question
+    detected_lang = _detect_response_language(data.message or "")
 
     # ── Chargement parallèle depuis DB ────────────────────────────────────────
     async def _get_user():
@@ -422,18 +479,36 @@ async def api_chat(data: ChatIn):
         asyncio.create_task(_safe_save_msg(uid, "user", data.message))
 
     # ── Construire les messages pour le LLM ───────────────────────────────────
-    lang_rule = (
-        "(Règle : réponds IMPÉRATIVEMENT en Français.)"
-        if detected_lang == "fr"
-        else "(Rule: answer in English.)"
-    )
-    system_prompt    = _build_chat_system_prompt(db_user, db_jobs)
+    # Strong language rule so the model follows it even when history is in the other language
+    if detected_lang == "fr":
+        lang_rule = (
+            "\n\n[RÈGLE OBLIGATOIRE : Réponds UNIQUEMENT en français. "
+            "L'utilisateur a écrit en français. N'utilise pas l'anglais.]"
+        )
+    else:
+        lang_rule = (
+            "\n\n[MANDATORY RULE: Respond ONLY in English. "
+            "The user wrote in English. Do not use French.]"
+        )
+    system_prompt = _build_chat_system_prompt(db_user, db_jobs)
+    # CRITICAL: Put language instruction FIRST so the model follows it (system prompt is mostly FR)
+    if detected_lang == "fr":
+        lang_block = (
+            "CRITIQUE — LANGUE : Tu DOIS répondre UNIQUEMENT en français. "
+            "L'utilisateur a écrit en français. N'utilise pas l'anglais dans ta réponse.\n\n"
+        )
+    else:
+        lang_block = (
+            "CRITICAL — LANGUAGE: You MUST respond ONLY in English. "
+            "The user wrote in English. Do not use French in your response.\n\n"
+        )
+    system_prompt = lang_block + system_prompt.rstrip()
     messages_payload = [{"role": "system", "content": system_prompt}]
     for h in history[-16:]:
         messages_payload.append({"role": h["role"], "content": h["content"]})
     messages_payload.append({
         "role": "user",
-        "content": data.message + f"\n\n{lang_rule}"
+        "content": (data.message or "").strip() + lang_rule
     })
 
     # ── Appel Azure OpenAI ────────────────────────────────────────────────────

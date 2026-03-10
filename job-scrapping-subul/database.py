@@ -115,6 +115,8 @@ ALTER TABLE users ADD COLUMN IF NOT EXISTS linkedin   TEXT;
 
 -- Add xai column for explainable AI (LLM-as-judge output) if missing
 ALTER TABLE jobs ADD COLUMN IF NOT EXISTS xai JSONB;
+ALTER TABLE jobs ADD COLUMN IF NOT EXISTS dedupe_key TEXT;
+CREATE INDEX IF NOT EXISTS idx_jobs_dedupe_user ON jobs(dedupe_key) WHERE dedupe_key IS NOT NULL;
 
 -- ── Table jobs ───────────────────────────────────────────────────────────────
 CREATE TABLE IF NOT EXISTS jobs (
@@ -140,6 +142,7 @@ CREATE TABLE IF NOT EXISTS jobs (
     remote           TEXT,
     skills_gap       TEXT,
     xai              JSONB,
+    dedupe_key       TEXT,
     created_at       TIMESTAMP DEFAULT NOW()
 );
 
@@ -345,6 +348,18 @@ async def update_user_profile(
 #  CRUD jobs
 # ─────────────────────────────────────────────────────────────────────────────
 
+def _job_dedupe_key(title: str, company: str) -> str:
+    """Normalize title + company so same role from different sources = one row."""
+    t = (title or "").strip().lower()
+    c = (company or "").strip().lower()
+    t = " ".join(t.split())
+    c = " ".join(c.split())
+    for suffix in (", inc.", " inc.", ", inc", " inc", ", llc.", " llc.", " llc"):
+        if c.endswith(suffix):
+            c = c[: -len(suffix)].strip()
+    return f"{t}|{c}"
+
+
 async def insert_job(user_id: int, card: dict) -> bool:
     logger.info(f"[db] insert_job called — user_id={user_id} url={card.get('url','')[:60]}")
 
@@ -356,41 +371,60 @@ async def insert_job(user_id: int, card: dict) -> bool:
         logger.warning("[db] insert_job skipped: url vide")
         return False
 
-    gap_missing = card.get("gap_missing", [])
-    skills_gap  = _json.dumps(gap_missing, ensure_ascii=False)
-
-    xai_obj = card.get("xai")
-    xai_db  = _json.dumps(xai_obj, ensure_ascii=False) if xai_obj else None
-
-    raw_match = card.get("match_score", -1)
-    match_score_db: Optional[float] = None
-    if raw_match is not None and raw_match >= 0:
-        match_score_db = float(raw_match)
-
-    raw_cosine = card.get("cosine", card.get("cosine_score", 0))
-    cosine_score_db = float(raw_cosine or 0)
-
-    raw_combined = card.get("combined_score", 0)
-    combined_score_db = float(raw_combined or 0)
+    title_ = card.get("title", "")
+    company_ = card.get("industry") or card.get("company", "")
+    dedupe_key = _job_dedupe_key(title_, company_)
 
     pool = await get_pool()
-    sql = """
-        INSERT INTO jobs (
-            id_user, url, source, title, industry, location,
-            seniority, must_have, nice_to_have,
-            description, responsibilities, requirements,
-            salary, match_score, cosine_score, combined_score,
-            contract, education, remote, skills_gap, xai
-        ) VALUES (
-            $1,  $2,  $3,  $4,  $5,  $6,
-            $7,  $8,  $9,
-            $10, $11, $12,
-            $13, $14, $15, $16,
-            $17, $18, $19, $20, $21::jsonb
-        )
-    """
     try:
         async with pool.acquire() as conn:
+            # Skip if we already have this (title, company) for this user (any source)
+            existing = await conn.fetchval(
+                """SELECT 1 FROM jobs
+                   WHERE $1 = ANY(id_user)
+                     AND (dedupe_key = $2 OR (dedupe_key IS NULL AND title = $3 AND industry = $4))
+                   LIMIT 1""",
+                user_id,
+                dedupe_key,
+                title_,
+                company_,
+            )
+            if existing:
+                logger.info(f"[db] skip duplicate — user={user_id} dedupe_key={dedupe_key[:50]}…")
+                return True
+
+            gap_missing = card.get("gap_missing", [])
+            skills_gap  = _json.dumps(gap_missing, ensure_ascii=False)
+
+            xai_obj = card.get("xai")
+            xai_db  = _json.dumps(xai_obj, ensure_ascii=False) if xai_obj else None
+
+            raw_match = card.get("match_score", -1)
+            match_score_db: Optional[float] = None
+            if raw_match is not None and raw_match >= 0:
+                match_score_db = float(raw_match)
+
+            raw_cosine = card.get("cosine", card.get("cosine_score", 0))
+            cosine_score_db = float(raw_cosine or 0)
+
+            raw_combined = card.get("combined_score", 0)
+            combined_score_db = float(raw_combined or 0)
+
+            sql = """
+                INSERT INTO jobs (
+                    id_user, url, source, title, industry, location,
+                    seniority, must_have, nice_to_have,
+                    description, responsibilities, requirements,
+                    salary, match_score, cosine_score, combined_score,
+                    contract, education, remote, skills_gap, xai, dedupe_key
+                ) VALUES (
+                    $1,  $2,  $3,  $4,  $5,  $6,
+                    $7,  $8,  $9,
+                    $10, $11, $12,
+                    $13, $14, $15, $16,
+                    $17, $18, $19, $20, $21::jsonb, $22
+                )
+            """
             await conn.execute(
                 sql,
                 [user_id],
@@ -414,6 +448,7 @@ async def insert_job(user_id: int, card: dict) -> bool:
                 card.get("remote", ""),
                 skills_gap,
                 xai_db,
+                dedupe_key,
             )
         logger.info(f"[db] ✅ Job inserted/updated — user={user_id} url={card.get('url','')[:60]}")
         return True
