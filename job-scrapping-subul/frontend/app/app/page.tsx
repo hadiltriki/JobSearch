@@ -89,7 +89,7 @@ function scoreToInterp(score: number): string {
 
 function JobCard({ job }: { job: Job }) {
   const [expanded,   setExpanded]   = useState(false);
-  const [showXAI,    setShowXAI]    = useState(!!(job.xai?.score_formula || job.xai?.interpretation));
+  const [showXAI,    setShowXAI]    = useState(false);
   const [showAllGap, setShowAllGap] = useState(false);
 
   const score  = normalizeScore(job.match_score) || normalizeScore(job.cosine ?? job.cosine_score) || 0;
@@ -182,9 +182,7 @@ function JobCard({ job }: { job: Job }) {
               <span style={{ fontSize: 12, fontWeight: 700, color: C.text }}>Score Explanation</span>
               <span style={{ fontSize: 10, padding: "2px 8px", borderRadius: 4, background: b.bg, color: b.color, fontWeight: 700 }}>{b.label}</span>
             </div>
-            {job.xai?.score_formula && (
-              <div style={{ fontSize: 10, color: C.muted, fontFamily: MONO, marginBottom: 8, padding: "6px 8px", background: C.bg, borderRadius: 6 }}>📐 {job.xai.score_formula}</div>
-            )}
+          
             {(() => {
               const cosP   = normalizeScore(job.xai?.cosine_score ?? job.cosine ?? job.cosine_score);
               const cosCol = scoreColor(cosP);
@@ -1097,7 +1095,7 @@ function MatchesTab({ isScanning, scanJobs, jobs, jobsLoad, roleFilter, setRoleF
           <div style={{ display: "flex", justifyContent: "center", gap: 7, marginBottom: 20 }}>
             {[0, 150, 300].map(d => <div key={d} style={{ width: 11, height: 11, borderRadius: "50%", background: C.p1, animation: `bounce 0.9s ${d}ms ease-in-out infinite` }} />)}
           </div>
-          <div style={{ fontSize: 17, fontWeight: 700, color: C.text, marginBottom: 10 }}>Scraping in progress…</div>
+          <div style={{ fontSize: 17, fontWeight: 700, color: C.text, marginBottom: 10 }}>"Search in progress…</div>
           <div style={{ fontSize: 13, color: C.muted }}>Scraping boards · AI scoring · Skills gap computation</div>
         </div>
       )}
@@ -1174,13 +1172,11 @@ function Dashboard() {
   useEffect(() => {
     if (!userId) { router.replace("/"); return; }
     if (shouldScan) {
-      const cv = sessionStorage.getItem("jobscan_cv_text") || "";
-      runScan(cv);
+      runScan();          // plus de cv_text
     } else {
       fetchUserAndJobs();
     }
   }, []);
-
   useEffect(() => {
     if (activeTab === "gap" && userId && !gapData) {
       setGapLoad(true);
@@ -1196,7 +1192,7 @@ function Dashboard() {
 
   async function fetchUserAndJobs() {
     try {
-      const r = await fetch("/api/login", { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ user_id: userId }) });
+      const r = await fetch(`/api/user/${userId}`);
       if (r.ok) { const d = await r.json(); setUserName(d.name || `User #${userId}`); }
     } catch {}
     loadJobs();
@@ -1267,65 +1263,62 @@ function Dashboard() {
     const a    = document.createElement("a"); a.href = url; a.download = `career_report_${userId}.pdf`; a.click(); URL.revokeObjectURL(url);
   }
 
-  async function runScan(cvText: string) {
-    setIsScanning(true);
-    setPipeSteps({ ...initPipeSteps(), lang: "active" });
-    setPipeRole(""); setScanJobs([]); setEnrichN(0);
-    try {
-      const resp = await fetch("http://localhost:8000/scan", {
-        method: "POST", headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({ cv_text: cvText, user_id: userId }),
-      });
-      if (!resp.ok || !resp.body) throw new Error("Scan request failed");
-      const reader  = resp.body.getReader();
-      const decoder = new TextDecoder();
-      let buf = "", enriched = 0;
-      while (true) {
-        const { done, value } = await reader.read();
-        if (done) break;
-        buf += decoder.decode(value, { stream: true });
-        const chunks = buf.split("\n\n");
-        buf = chunks.pop() || "";
-        for (const chunk of chunks) {
-          const line = chunk.trim();
-          if (!line.startsWith("data: ")) continue;
-          let d: any;
-          try { d = JSON.parse(line.slice(6)); } catch { continue; }
-          switch (d.event) {
-            case "lang_ready":  setPipeSteps(p => ({ ...p, lang: "done", title: "active" })); break;
-            case "cv_title":    setPipeSteps(p => ({ ...p, title: "done", struct: "active" })); if (d.title) setPipeRole(d.title); break;
-            case "cv_ready":    setPipeSteps(p => ({ ...p, struct: "done", dbuser: "active", scrape: "active", enrich: "active" })); break;
-            case "user_saved":  setPipeSteps(p => ({ ...p, dbuser: "done" })); break;
-            case "source_done": setPipeSteps(p => ({ ...p, [d.source]: "done" })); break;
-            case "job":
-              enriched++;
-              setEnrichN(enriched);
-              setScanJobs(prev => [...prev, d as Job]);
-              if (enriched === 1) setPipeSteps(p => ({ ...p, dbjobs: "active" }));
-              break;
-            case "done":
-              setPipeSteps(p => ({ ...p, scrape: "done", enrich: "done", dbjobs: "done" }));
-              reader.cancel();
-              // Keep scan result (with xai) visible after scan: copy scanJobs into jobs
-              // so when isScanning becomes false we show the same cards (with xai).
-              setScanJobs(prev => {
-                if (prev.length) setJobs([...prev]);
-                return prev;
-              });
-              break;
-          }
+  async function runScan() {
+  setIsScanning(true);
+  setPipeSteps({ ...initPipeSteps(), lang: "active" });
+  setPipeRole(""); setScanJobs([]); setEnrichN(0);
+  try {
+    const resp = await fetch("http://localhost:8000/scan", {
+      method: "POST", headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ user_id: userId }),   // plus de cv_text
+    });
+    if (!resp.ok || !resp.body) throw new Error("Scan request failed");
+    const reader  = resp.body.getReader();
+    const decoder = new TextDecoder();
+    let buf = "", enriched = 0;
+    while (true) {
+      const { done, value } = await reader.read();
+      if (done) break;
+      buf += decoder.decode(value, { stream: true });
+      const chunks = buf.split("\n\n");
+      buf = chunks.pop() || "";
+      for (const chunk of chunks) {
+        const line = chunk.trim();
+        if (!line.startsWith("data: ")) continue;
+        let d: any;
+        try { d = JSON.parse(line.slice(6)); } catch { continue; }
+        switch (d.event) {
+          case "cv_title":
+          case "cv_ready":
+            setPipeSteps(p => ({ ...p, lang: "done", scrape: "active", enrich: "active" }));
+            if (d.title) setPipeRole(d.title);
+            break;
+          case "source_done":
+            setPipeSteps(p => ({ ...p, [d.source]: "done" }));
+            break;
+          case "job":
+            enriched++;
+            setEnrichN(enriched);
+            setScanJobs(prev => [...prev, d as Job]);
+            break;
+          case "done":
+            setPipeSteps(p => ({ ...p, lang: "done", scrape: "done", enrich: "done" }));
+            reader.cancel();
+            setScanJobs(prev => { if (prev.length) setJobs([...prev]); return prev; });
+            break;
         }
       }
-      const r = await fetch("/api/login", { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ user_id: userId }) });
-      if (r.ok) { const d = await r.json(); setUserName(d.name || `User #${userId}`); }
-      // Do not call loadJobs() here: we already set jobs from scanJobs above so xai stays visible.
-      // User can click "Search" to refresh from DB.
-    } catch (err) {
-      console.error("Scan error:", err);
-    } finally {
-      setIsScanning(false);
     }
+    // Charger le nom user depuis CosmosDB
+    const r = await fetch(`/api/user/${userId}`);
+    if (r.ok) { const d = await r.json(); setUserName(d.name || `User #${userId}`); }
+  } catch (err) {
+    console.error("Scan error:", err);
+  } finally {
+    setIsScanning(false);
   }
+}
+
 
   // ── LOGOUT : vide le chat local PUIS redirige ─────────────────────────────
   function logout() {

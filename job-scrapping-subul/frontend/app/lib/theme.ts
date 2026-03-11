@@ -29,17 +29,15 @@ export const C = {
 export type PipeState = "waiting" | "active" | "done";
 
 export const PIPE_STEPS = [
-  { id: "lang",   icon: "🌍", label: "Detecting language"  },
-  { id: "title",  icon: "🤖", label: "Extracting title"    },
-  { id: "struct", icon: "🧬", label: "Structuring CV"      },
-  { id: "dbuser", icon: "💾", label: "Saving profile → DB" },
-  { id: "scrape", icon: "🕷️", label: "Scraping jobs"       },
-  { id: "enrich", icon: "🧠", label: "Enriching & scoring" },
-  { id: "dbjobs", icon: "🗄️", label: "Saving jobs → DB"   },
+{ id: "lang",   icon: "🌍", label: "Reading your profile"     },
+
+{ id: "scrape", icon: "🔍", label: "Searching job offers"     },
+{ id: "enrich", icon: "🧠", label: "Analyzing matches"        }
+
 ] as const;
 
 export const SOURCES = [
-  "aijobs", "remoteok", "emploitic", "tanitjobs", "greenhouse", "eluta",
+  "aijobs", "remoteok", "tanitjobs", "greenhouse", "eluta", "linkedin", "indeed", "lever","whatjobs", "Welcome to the Jungle"
 ] as const;
 
 export function initPipeSteps(): Record<string, PipeState> {
