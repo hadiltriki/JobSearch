@@ -43,13 +43,13 @@ from scraper_utils import extract_tech_from_description
 # (scraper.py imports scraper_whatjobs.py, so importing scrape_whatjobs
 #  via scraper.py from within scraping_pipeline.py creates a cycle.)
 # --- Commented out (enable when re-adding these sources) ---
-#from scraper_remoteok   import scrape_remoteok                                 # ✅ ACTIVE
-# from scraper_emploitic import scrape_emploitic, _scrape_emploitic_fetch_one  # commenté
-# from scraper_whatjobs  import scrape_whatjobs                                # commenté
-# from scraper_aijobs    import scrape_aijobs                                  # commenté
-# from scraper_tanitjobs import scrape_tanitjobs
-# from scraper_greenhouse import scrape_greenhouse                              # commenté
-# from scraper_eluta     import scrape_eluta                                   # commenté
+from scraper_remoteok   import scrape_remoteok                                 # ✅ ACTIVE
+#from scraper_emploitic import scrape_emploitic, _scrape_emploitic_fetch_one  # commenté
+from scraper_whatjobs  import scrape_whatjobs                                # commenté
+from scraper_aijobs    import scrape_aijobs                                  # commenté
+from scraper_tanitjobs import scrape_tanitjobs
+from scraper_greenhouse import scrape_greenhouse                              # commenté
+from scraper_eluta     import scrape_eluta                                   # commenté
 # --- Active: Indeed, LinkedIn, Lever, WTTJ ---
 from scraper_indeed   import scrape_indeed
 from scraper_linkedin import scrape_linkedin
@@ -70,7 +70,7 @@ COSINE_THRESHOLD           = 0.60
 COSINE_THRESHOLD_EMPLOITIC = 0.60
 MAX_AGE_DAYS               = 45
 LLM_CONCURRENCY            = 4
-NUM_SOURCES                = 3   # Indeed, LinkedIn, WTTJ (Lever commented out — was blocking WTTJ)
+NUM_SOURCES                = 10   # Indeed, LinkedIn, WTTJ (Lever commented out — was blocking WTTJ)
 
 SHARED_HEADERS = {
     "User-Agent": (
@@ -117,16 +117,80 @@ def sse(payload: dict) -> str:
     return f"data: {json.dumps(payload, ensure_ascii=False)}\n\n"
 
 
-def _job_dedupe_key(title: str, company: str) -> str:
-    """Normalize title + company so the same role from Indeed vs LinkedIn gets one row."""
-    t = (title or "").strip().lower()
+def _normalize_company_for_dedupe(company: str) -> str:
+    """Canonical company name for dedupe: strip ' — Sector', ' / Subsector' so same employer = one key."""
     c = (company or "").strip().lower()
-    # collapse spaces and ignore minor punctuation so "Acme, Inc." matches "Acme Inc"
-    t = " ".join(t.split())
     c = " ".join(c.split())
+    if " — " in c:
+        c = c.split(" — ")[0].strip()
+    if " / " in c:
+        c = c.split(" / ")[0].strip()
     for suffix in (", inc.", " inc.", ", inc", " inc", ", llc.", " llc.", " llc"):
         if c.endswith(suffix):
             c = c[: -len(suffix)].strip()
+    return c
+
+
+# Prefixes/suffixes to strip from job titles so TanitJobs/whatjobs/other sources dedupe correctly
+_TITLE_DEDUPE_STRIP = (
+    "offre d'emploi ",
+    "offre d'emploi",
+    "we're hiring: ",
+    "we're hiring:",
+    "stage : ",
+    "stage :",
+    "formation ",
+    "emploi tunisie ",
+    "emploi tunisie",
+    # whatjobs / aggregator-style
+    "découvrez les dernières offres en ",
+    "0 ofertas de ",
+    "ofertas de ",
+    "emplois ",
+)
+_TITLE_DEDUPE_SUFFIXES = (
+    " en argentina",
+    " en france",
+    " uk / en france",
+    " (remote)",
+    " (argentina)",
+    " (tunisia)",
+)
+
+
+def _normalize_title_for_dedupe(title: str) -> str:
+    """Canonical title for dedupe: strip common prefixes/suffixes and normalize whitespace/slashes."""
+    t = (title or "").strip().lower()
+    t = " ".join(t.split())
+    for prefix in _TITLE_DEDUPE_STRIP:
+        if t.startswith(prefix):
+            t = t[len(prefix):].strip()
+    for suffix in _TITLE_DEDUPE_SUFFIXES:
+        if t.endswith(suffix):
+            t = t[: -len(suffix)].strip()
+    # Normalize " / " and " - " to single space so "Expert IA / Data Scientist" matches across variants
+    for sep in (" / ", " /", "/ ", " – ", " - ", " — "):
+        t = t.replace(sep, " ")
+    t = " ".join(t.split())
+    return t
+
+
+def _job_dedupe_key(title: str, company: str) -> str:
+    """Normalize title + company so the same role from different sources gets one row.
+    When title is 'Title / Company' (e.g. eluta), use title part and company part so
+    duplicates with or without company field still get the same key."""
+    raw_title = (title or "").strip()
+    raw_company = (company or "").strip()
+    if " / " in raw_title:
+        parts = raw_title.split(" / ", 1)
+        title_for_key = parts[0].strip()
+        company_from_title = parts[1].strip() if len(parts) > 1 else ""
+        company_for_key = raw_company or company_from_title
+    else:
+        title_for_key = raw_title
+        company_for_key = raw_company
+    t = _normalize_title_for_dedupe(title_for_key)
+    c = _normalize_company_for_dedupe(company_for_key)
     return f"{t}|{c}"
 
 
@@ -718,17 +782,17 @@ async def pipeline(cv_text: str, user_id: int = 0):
         # Dedupe: same (title, company) from multiple sources → one row (first wins).
         # Start LinkedIn first so it’s more likely to be the “original” when duplicated.
         #
-        # asyncio.create_task(run_source("aijobs",     scrape_aijobs,     session))
-        # asyncio.create_task(run_source("remoteok",   scrape_remoteok,   session))
-        # asyncio.create_task(run_source("tanitjobs",  scrape_tanitjobs,  session))
-        # asyncio.create_task(run_source("greenhouse", scrape_greenhouse, session))
-        # asyncio.create_task(run_source("eluta",      scrape_eluta,      session))
-        # asyncio.create_task(run_source("whatjobs",   scrape_whatjobs,   session))
-        # asyncio.create_task(run_source("emploitic",  scrape_emploitic,  session))
+        asyncio.create_task(run_source("aijobs",     scrape_aijobs,     session))
+        asyncio.create_task(run_source("remoteok",   scrape_remoteok,   session))
+        asyncio.create_task(run_source("tanitjobs",  scrape_tanitjobs,  session))
+        asyncio.create_task(run_source("greenhouse", scrape_greenhouse, session))
+        asyncio.create_task(run_source("eluta",      scrape_eluta,      session))
+        asyncio.create_task(run_source("whatjobs",   scrape_whatjobs,   session))
+        #asyncio.create_task(run_source("emploitic",  scrape_emploitic,  session))
         # --- Active: Indeed, LinkedIn, WTTJ (Lever commented — was blocking WTTJ) ---
         asyncio.create_task(run_source("linkedin", scrape_linkedin, session))
         asyncio.create_task(run_source("indeed",   scrape_indeed,  session))
-        # asyncio.create_task(run_source("lever",    scrape_lever,    session))
+        asyncio.create_task(run_source("lever",    scrape_lever,    session))
         asyncio.create_task(run_source("wttj",     scrape_wttj,    session))
 
         # ── Boucle SSE principale ─────────────────────────────────────────────

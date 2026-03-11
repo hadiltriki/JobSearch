@@ -348,15 +348,79 @@ async def update_user_profile(
 #  CRUD jobs
 # ─────────────────────────────────────────────────────────────────────────────
 
-def _job_dedupe_key(title: str, company: str) -> str:
-    """Normalize title + company so same role from different sources = one row."""
-    t = (title or "").strip().lower()
+def _normalize_company_for_dedupe(company: str) -> str:
+    """Canonical company name for dedupe: strip ' — Sector', ' / Subsector' so same employer = one key."""
     c = (company or "").strip().lower()
-    t = " ".join(t.split())
     c = " ".join(c.split())
+    # "Company — Defense / Intelligence" or "Company / Division" → "Company"
+    if " — " in c:
+        c = c.split(" — ")[0].strip()
+    if " / " in c:
+        c = c.split(" / ")[0].strip()
     for suffix in (", inc.", " inc.", ", inc", " inc", ", llc.", " llc.", " llc"):
         if c.endswith(suffix):
             c = c[: -len(suffix)].strip()
+    return c
+
+
+# Title prefixes/suffixes to strip for dedupe (must match scraping_pipeline._normalize_title_for_dedupe)
+_TITLE_DEDUPE_STRIP = (
+    "offre d'emploi ",
+    "offre d'emploi",
+    "we're hiring: ",
+    "we're hiring:",
+    "stage : ",
+    "stage :",
+    "formation ",
+    "emploi tunisie ",
+    "emploi tunisie",
+    "découvrez les dernières offres en ",
+    "0 ofertas de ",
+    "ofertas de ",
+    "emplois ",
+)
+_TITLE_DEDUPE_SUFFIXES = (
+    " en argentina",
+    " en france",
+    " uk / en france",
+    " (remote)",
+    " (argentina)",
+    " (tunisia)",
+)
+
+
+def _normalize_title_for_dedupe(title: str) -> str:
+    """Canonical title for dedupe: strip common prefixes/suffixes and normalize whitespace/slashes."""
+    t = (title or "").strip().lower()
+    t = " ".join(t.split())
+    for prefix in _TITLE_DEDUPE_STRIP:
+        if t.startswith(prefix):
+            t = t[len(prefix):].strip()
+    for suffix in _TITLE_DEDUPE_SUFFIXES:
+        if t.endswith(suffix):
+            t = t[: -len(suffix)].strip()
+    for sep in (" / ", " /", "/ ", " – ", " - ", " — "):
+        t = t.replace(sep, " ")
+    t = " ".join(t.split())
+    return t
+
+
+def _job_dedupe_key(title: str, company: str) -> str:
+    """Normalize title + company so same role from different sources = one row.
+    When title is 'Title / Company' (e.g. eluta), use title part and company part so
+    duplicates with or without company field still get the same key."""
+    raw_title = (title or "").strip()
+    raw_company = (company or "").strip()
+    if " / " in raw_title:
+        parts = raw_title.split(" / ", 1)
+        title_for_key = parts[0].strip()
+        company_from_title = parts[1].strip() if len(parts) > 1 else ""
+        company_for_key = raw_company or company_from_title
+    else:
+        title_for_key = raw_title
+        company_for_key = raw_company
+    t = _normalize_title_for_dedupe(title_for_key)
+    c = _normalize_company_for_dedupe(company_for_key)
     return f"{t}|{c}"
 
 
@@ -477,8 +541,18 @@ async def get_jobs_for_user(user_id: int) -> list[dict]:
                 """,
                 user_id,
             )
+        raw_count = len(rows)
+        # Build list then dedupe by (title, normalized company) so same role appears once
+        def _row_key(r) -> str:
+            return _job_dedupe_key(r["title"] or "", r["industry"] or "")
+
+        seen_keys: set[str] = set()
         result = []
         for row in rows:
+            nkey = _row_key(row)
+            if nkey in seen_keys:
+                continue
+            seen_keys.add(nkey)
             gap = []
             try:
                 gap = _json.loads(row["skills_gap"] or "[]")
@@ -546,7 +620,7 @@ async def get_jobs_for_user(user_id: int) -> list[dict]:
                 "xai":            xai_val,
                 "_needs_xai_backfill": needs_xai_backfill,
             })
-        logger.info(f"[db] get_jobs_for_user: {len(result)} jobs for user_id={user_id}")
+        logger.info(f"[db] get_jobs_for_user: {len(result)} jobs (raw rows={raw_count}) for user_id={user_id}")
         return result
     except Exception as e:
         logger.error(f"[db] get_jobs_for_user failed for user_id={user_id}: {e}")

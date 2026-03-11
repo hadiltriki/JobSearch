@@ -97,8 +97,8 @@ function JobCard({ job }: { job: Job }) {
   const interp = job.xai?.interpretation ?? scoreToInterp(score);
   const b      = interpBadge(interp);
 
-  const missingAll    = job.gap_missing || [];
-  const matchedAll    = job.gap_matched || [];
+  const missingAll    = Array.isArray(job.gap_missing) ? job.gap_missing : [];
+  const matchedAll    = Array.isArray(job.gap_matched) ? job.gap_matched : [];
   const PREVIEW_MISS  = 3;
   const PREVIEW_MATCH = 2;
   const extraMissing  = missingAll.length - PREVIEW_MISS;
